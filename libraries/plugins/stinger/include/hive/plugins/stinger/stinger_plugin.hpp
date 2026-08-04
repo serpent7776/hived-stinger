@@ -13,9 +13,12 @@ namespace detail { class stinger_plugin_impl; }
 /**
  * Real-time trigger/notification (CEP) plugin.
  *
- * Feeds blockchain operations into a pattern-matching engine and fires
- * user-registered rules as blocks are applied. Fork rollback is handled by
- * retracting facts above the fork point; irreversibility finalizes them.
+ * Matches each operation against user-registered rules held in a be-tree
+ * subscription index as blocks are applied, and emits matches immediately as
+ * an ordered event stream alongside block_applied / switch_fork /
+ * irreversible lifecycle events. The plugin is stateless; fork handling is
+ * left to stream consumers (an at-irreversible delivery mode may be layered
+ * on top later).
  */
 class stinger_plugin : public appbase::plugin< stinger_plugin >
 {
