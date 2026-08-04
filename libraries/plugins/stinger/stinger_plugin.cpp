@@ -7,6 +7,10 @@
 
 #include <hive/utilities/signal.hpp>
 
+extern "C" {
+#include <betree.h>
+}
+
 #include <memory>
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
@@ -51,6 +55,11 @@ public:
   chain::database&              _db;
   fc::path                      rules_file;
 
+  /// be-tree subscription index; built once in plugin_startup, then read-only
+  /// on the writer thread (this be-tree fork has no subscription deletion, so
+  /// dynamic rule reload means rebuilding the index).
+  std::unique_ptr< betree, decltype( &betree_free ) > _matcher{ nullptr, &betree_free };
+
   chain::database::signal_connection_ptr post_apply_operation_connection;
   chain::database::signal_connection_ptr post_apply_block_connection;
   chain::database::signal_connection_ptr irreversible_block_connection;
@@ -61,8 +70,9 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
 {
   // build a be-tree event from the operation (real and virtual alike) -
   // note.op.which() as the op-type attribute, operation_get_impacted_accounts
-  // as a string-list attribute, amounts/symbols as numeric attributes - run
-  // betree_search and emit match{ rule_id, note.block, note.trx_in_block,
+  // as a string-list attribute, amounts/symbols as numeric attributes
+  // (betree_make_event + betree_make_*_variable) - run betree_search_with_event
+  // on _matcher and emit match{ rule_id, note.block, note.trx_in_block,
   // note.op_in_trx, note.virtual_op } for each matched rule. The block id of
   // the containing block is not known yet; the block_applied event that
   // follows the block's matches carries it.
@@ -140,9 +150,12 @@ void stinger_plugin::plugin_startup()
   try
   {
     ilog( "stinger: plugin_startup() begin" );
-    // build the be-tree subscription index from rules_file: declare the typed
-    // attribute domains (op type, impacted accounts, amounts, ...), then insert
-    // each rule's boolean expression, keeping rule_id -> subscription id. The
+    my->_matcher.reset( betree_make() );
+    FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
+    // populate the index from rules_file: declare the typed attribute domains
+    // (op type via betree_add_integer_variable, impacted accounts via
+    // betree_add_string_list_variable, amounts as integers, ...), then
+    // betree_insert each rule's boolean expression under its rule_id. The
     // index is in-memory only and cheap to rebuild here on every startup.
     ilog( "stinger: plugin_startup() end" );
   } FC_CAPTURE_AND_RETHROW()
@@ -154,6 +167,7 @@ void stinger_plugin::plugin_shutdown()
   hive::utilities::disconnect_signal( my->post_apply_block_connection );
   hive::utilities::disconnect_signal( my->irreversible_block_connection );
   hive::utilities::disconnect_signal( my->switch_fork_connection );
+  my->_matcher.reset();
 }
 
 } } } // hive::plugins::stinger

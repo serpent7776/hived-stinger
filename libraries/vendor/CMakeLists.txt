@@ -229,3 +229,18 @@ SET(ZSTD_BUILD_CONTRIB OFF)
 SET(ZSTD_BUILD_TESTS OFF)
 SET(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "Build ZSTD programs")
 add_subdirectory(zstd/build/cmake)
+
+# --- be-tree (boolean-expression matcher used by the stinger plugin) ---
+# Upstream builds with a plain Makefile; the flex/bison outputs are committed,
+# so all of src/*.c compiles directly without generator tools.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/be-tree/src/betree.h")
+  message(FATAL_ERROR
+    "be-tree submodule not initialized. Run: git submodule update --init --recursive")
+endif()
+file(GLOB BETREE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/be-tree/src/*.c")
+add_library(betree STATIC ${BETREE_SOURCES})
+target_include_directories(betree SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/be-tree/src")
+set_target_properties(betree PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+# vendor code is not held to hive's warning settings
+target_compile_options(betree PRIVATE -w)
+target_link_libraries(betree PUBLIC m)

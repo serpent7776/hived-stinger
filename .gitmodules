@@ -20,3 +20,6 @@
 [submodule "libraries/appbase"]
 	path = libraries/appbase
 	url = ../appbase.git
+[submodule "libraries/vendor/be-tree"]
+	path = libraries/vendor/be-tree
+	url = https://github.com/adgear/be-tree.git

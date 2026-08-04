@@ -5,7 +5,7 @@ add_library( stinger_plugin
              ${HEADERS}
            )
 
-target_link_libraries( stinger_plugin chain_plugin )
+target_link_libraries( stinger_plugin chain_plugin betree )
 target_include_directories( stinger_plugin
                             PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" )
 
