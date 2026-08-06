@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "name": "large-hive-transfer",
+      "match": "op_type = 2 and symbol = \"HIVE\" and amount > 1000000",
+      "exec": { "type": "log" }
+    },
+    {
+      "name": "alice-activity",
+      "match": "\"alice\" in impacted_accounts",
+      "exec": { "type": "log" }
+    },
+    {
+      "name": "splinterlands-market",
+      "match": "op_type = 18 and custom_id = \"sm_market\"",
+      "exec": { "type": "webhook", "url": "http://127.0.0.1:8080/stinger" }
+    }
+  ]
+}

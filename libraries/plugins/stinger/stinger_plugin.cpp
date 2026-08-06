@@ -1,9 +1,12 @@
 #include <hive/chain/hive_fwd.hpp>
 
+#include <hive/plugins/stinger/rules.hpp>
 #include <hive/plugins/stinger/stinger_plugin.hpp>
 
 #include <hive/chain/database.hpp>
 #include <hive/chain/notifications.hpp>
+
+#include <hive/protocol/operations.hpp>
 
 #include <hive/utilities/signal.hpp>
 
@@ -11,6 +14,7 @@ extern "C" {
 #include <betree.h>
 }
 
+#include <cstdint>
 #include <memory>
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
@@ -27,7 +31,7 @@ namespace detail {
  * stream. Fork handling is the consumer's job; the stream carries everything
  * needed for it:
  *
- *   match          { rule_id, block_num, trx_in_block, op_in_trx, virtual_op }
+ *   match          { rule name, block_num, trx_in_block, op_in_trx, virtual_op }
  *   block_applied  { block_num, block_id }   - seals a block; carries the id
  *                                              that identifies its branch
  *   switch_fork    { new_head_block_num }    - discard held state above N
@@ -54,6 +58,7 @@ public:
   plugins::chain::chain_plugin& _chain_plugin;
   chain::database&              _db;
   fc::path                      rules_file;
+  rules_config                  rules;
 
   /// be-tree subscription index; built once in plugin_startup, then read-only
   /// on the writer thread (this be-tree fork has no subscription deletion, so
@@ -110,6 +115,25 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   // re-applied afterwards and its ops are matched fresh.
 }
 
+/**
+ * Attribute vocabulary rule exprs are written against. The event builder in
+ * on_post_apply_operation must stamp exactly these attributes - extend both
+ * together.
+ */
+void declare_rule_attributes( betree* tree )
+{
+  // op.which() over hive::protocol::operation (virtual ops included)
+  betree_add_integer_variable( tree, "op_type", false, 0, hive::protocol::operation::count() - 1 );
+  // operation_get_impacted_accounts of the op
+  betree_add_string_list_variable( tree, "impacted_accounts", false, SIZE_MAX );
+  // primary asset of ops that carry one: amount in satoshis + symbol name;
+  // undefined for ops without an asset
+  betree_add_integer_variable( tree, "amount", true, 0, INT64_MAX );
+  betree_add_string_variable( tree, "symbol", true, SIZE_MAX );
+  // custom_json_operation id; undefined for other op types
+  betree_add_string_variable( tree, "custom_id", true, SIZE_MAX );
+}
+
 } // detail
 
 stinger_plugin::stinger_plugin() {}
@@ -129,8 +153,12 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     ilog( "stinger: plugin_initialize() begin" );
     my = std::make_unique< detail::stinger_plugin_impl >( get_app() );
 
-    if( options.count( STINGER_RULES_FILE_KEY ) )
-      my->rules_file = options.at( STINGER_RULES_FILE_KEY ).as< std::string >();
+    FC_ASSERT( options.count( STINGER_RULES_FILE_KEY ),
+      "stinger: " STINGER_RULES_FILE_KEY " is required when the stinger plugin is enabled" );
+    my->rules_file = options.at( STINGER_RULES_FILE_KEY ).as< std::string >();
+    my->rules = load_rules_file( my->rules_file );
+    ilog( "stinger: loaded ${n} rule(s) from ${f}",
+      ("n", my->rules.rules.size())("f", my->rules_file.generic_string()) );
 
     my->post_apply_operation_connection = my->_db.add_post_apply_operation_handler(
       [&]( const operation_notification& note ) { try { my->on_post_apply_operation( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
@@ -152,11 +180,14 @@ void stinger_plugin::plugin_startup()
     ilog( "stinger: plugin_startup() begin" );
     my->_matcher.reset( betree_make() );
     FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
-    // populate the index from rules_file: declare the typed attribute domains
-    // (op type via betree_add_integer_variable, impacted accounts via
-    // betree_add_string_list_variable, amounts as integers, ...), then
-    // betree_insert each rule's boolean expression under its rule_id. The
-    // index is in-memory only and cheap to rebuild here on every startup.
+    detail::declare_rule_attributes( my->_matcher.get() );
+    for( const auto& rule : my->rules.rules )
+    {
+      FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
+        "stinger: rule \"${n}\" (id ${i}) failed to parse: ${e}",
+        ("n", rule.name)("i", rule.id)("e", rule.match) );
+    }
+    ilog( "stinger: subscription index built, ${n} rule(s)", ("n", my->rules.rules.size()) );
     ilog( "stinger: plugin_startup() end" );
   } FC_CAPTURE_AND_RETHROW()
 }

@@ -2,6 +2,7 @@ file(GLOB HEADERS "include/hive/plugins/stinger/*.hpp")
 
 add_library( stinger_plugin
              stinger_plugin.cpp
+             rules.cpp
              ${HEADERS}
            )
 
