@@ -6,6 +6,8 @@
 #include <hive/chain/database.hpp>
 #include <hive/chain/notifications.hpp>
 
+#include <hive/protocol/asset.hpp>
+#include <hive/protocol/forward_impacted.hpp>
 #include <hive/protocol/operations.hpp>
 
 #include <hive/utilities/signal.hpp>
@@ -15,7 +17,11 @@ extern "C" {
 }
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
+#include <type_traits>
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
 
@@ -24,6 +30,49 @@ namespace hive { namespace plugins { namespace stinger {
 using namespace hive::chain;
 
 namespace detail {
+
+constexpr const char* STINGER_ATTR_OP_TYPE           = "op_type";
+constexpr const char* STINGER_ATTR_IMPACTED_ACCOUNTS = "impacted_accounts";
+constexpr const char* STINGER_ATTR_AMOUNT            = "amount";
+constexpr const char* STINGER_ATTR_SYMBOL            = "symbol";
+constexpr const char* STINGER_ATTR_CUSTOM_ID         = "custom_id";
+
+/// be-tree event variable ids as returned by betree_add_*_variable, used as betree_set_variable slots
+struct event_slots
+{
+  size_t op_type;
+  size_t impacted_accounts;
+  size_t amount;
+  size_t symbol;
+  size_t custom_id;
+};
+
+template< typename Op, typename = void >
+struct has_asset_amount : std::false_type {};
+template< typename Op >
+struct has_asset_amount< Op,
+  std::enable_if_t< std::is_same_v< decltype( Op::amount ), protocol::asset > > > : std::true_type {};
+
+/// pulls the per-op-type event attributes out of an operation
+struct event_attribute_visitor
+{
+  typedef void result_type;
+
+  std::optional< protocol::asset >& amount;
+  std::optional< std::string >&     custom_id;
+
+  void operator()( const protocol::custom_json_operation& op ) const
+  {
+    custom_id = std::string( op.id );
+  }
+
+  template< typename Op >
+  void operator()( const Op& op ) const
+  {
+    if constexpr( has_asset_amount< Op >::value )
+      amount = op.amount;
+  }
+};
 
 /**
  * Stateless stream emitter: matches each operation against the be-tree rule
@@ -65,6 +114,13 @@ public:
   /// dynamic rule reload means rebuilding the index).
   std::unique_ptr< betree, decltype( &betree_free ) > _matcher{ nullptr, &betree_free };
 
+  /// event variable indices assigned by declare_rule_attributes for _matcher
+  event_slots _slots{};
+
+  /// subscription id -> rule, for turning report ids back into rule names;
+  /// built in plugin_startup together with the index
+  std::map< uint64_t, const rule_definition* > _rules_by_id;
+
   chain::database::signal_connection_ptr post_apply_operation_connection;
   chain::database::signal_connection_ptr post_apply_block_connection;
   chain::database::signal_connection_ptr irreversible_block_connection;
@@ -73,20 +129,71 @@ public:
 
 void stinger_plugin_impl::on_post_apply_operation( const operation_notification& note )
 {
-  // build a be-tree event from the operation (real and virtual alike) -
-  // note.op.which() as the op-type attribute, operation_get_impacted_accounts
-  // as a string-list attribute, amounts/symbols as numeric attributes
-  // (betree_make_event + betree_make_*_variable) - run betree_search_with_event
-  // on _matcher and emit match{ rule_id, note.block, note.trx_in_block,
-  // note.op_in_trx, note.virtual_op } for each matched rule. The block id of
-  // the containing block is not known yet; the block_applied event that
-  // follows the block's matches carries it.
-  //
-  // Only ops that are part of an actual block may produce matches;
-  // pending/one-tx application rolls back silently and must not appear on the
-  // stream. Ops during reindex are skipped by design.
-  if( !_db.is_processing_block() || _db.is_replaying_block() )
+  // Only ops applied as part of an actual block may produce matches:
+  if( !_db.is_validating_block() )
     return;
+
+  std::optional< protocol::asset > amount;
+  std::optional< std::string >     custom_id;
+  note.op.visit( event_attribute_visitor{ amount, custom_id } );
+
+  fc::flat_set< protocol::account_name_type > impacted;
+  app::operation_get_impacted_accounts( note.op, impacted );
+
+  std::unique_ptr< betree_event, decltype( &betree_free_event ) > event(
+    betree_make_event( _matcher.get() ), &betree_free_event );
+  FC_ASSERT( event, "stinger: failed to create be-tree event" );
+
+  betree_set_variable( event.get(), _slots.op_type,
+    betree_make_integer_variable( STINGER_ATTR_OP_TYPE, note.op.which() ) );
+
+  // owned here until it is attached to the event, which frees it with the
+  // event; a throw in the loop must not leak it
+  std::unique_ptr< betree_string_list, decltype( &betree_free_string_list ) > accounts(
+    betree_make_string_list( impacted.size() ), &betree_free_string_list );
+  size_t account_idx = 0;
+  for( const auto& account : impacted )
+    betree_add_string( accounts.get(), account_idx++, std::string( account ).c_str() );
+  betree_set_variable( event.get(), _slots.impacted_accounts,
+    betree_make_string_list_variable( STINGER_ATTR_IMPACTED_ACCOUNTS, accounts.release() ) );
+
+  if( amount )
+  {
+    betree_set_variable( event.get(), _slots.amount,
+      betree_make_integer_variable( STINGER_ATTR_AMOUNT, amount->amount.value ) );
+    betree_set_variable( event.get(), _slots.symbol,
+      betree_make_string_variable( STINGER_ATTR_SYMBOL,
+        protocol::legacy_asset::from_asset( *amount ).asset_num_to_string().c_str() ) );
+  }
+
+  if( custom_id )
+    betree_set_variable( event.get(), _slots.custom_id,
+      betree_make_string_variable( STINGER_ATTR_CUSTOM_ID, custom_id->c_str() ) );
+
+  std::unique_ptr< report, decltype( &free_report ) > matches( make_report(), &free_report );
+  FC_ASSERT( matches, "stinger: failed to create be-tree report" );
+  FC_ASSERT( betree_search_with_event( _matcher.get(), event.get(), matches.get() ),
+    "stinger: be-tree search failed at block ${b} trx ${t} op ${o}",
+    ("b", note.block)("t", note.trx_in_block)("o", note.op_in_trx) );
+
+  if( matches->matched == 0 )
+    return;
+
+  // emit match{ rule name, block_num, trx_id, trx_in_block, op_in_trx,
+  // virtual_op, op body } per matched rule. The block id of the containing
+  // block is not known yet; the block_applied event that follows the block's
+  // matches carries it. Sinks are not implemented yet - matches go to the log.
+  fc::variant op_body;
+  fc::to_variant( note.op, op_body );
+  for( size_t i = 0; i < matches->matched; ++i )
+  {
+    auto rule = _rules_by_id.find( matches->subs[ i ] );
+    FC_ASSERT( rule != _rules_by_id.end(),
+      "stinger: matched subscription id ${i} has no rule", ("i", matches->subs[ i ]) );
+    ilog( "stinger: match rule=${r} block=${b} trx_id=${t} trx_in_block=${tib} op_in_trx=${oit} virtual_op=${v} op=${op}",
+      ("r", rule->second->name)("b", note.block)("t", note.trx_id)
+      ("tib", note.trx_in_block)("oit", note.op_in_trx)("v", note.virtual_op)("op", op_body) );
+  }
 }
 
 void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
@@ -115,23 +222,23 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   // re-applied afterwards and its ops are matched fresh.
 }
 
-/**
- * Attribute vocabulary rule exprs are written against. The event builder in
- * on_post_apply_operation must stamp exactly these attributes - extend both
- * together.
- */
-void declare_rule_attributes( betree* tree )
+/// registers the rule attributes and returns the event variable id betree assigned to each
+event_slots declare_rule_attributes( betree* tree )
 {
+  event_slots slots;
+
   // op.which() over hive::protocol::operation (virtual ops included)
-  betree_add_integer_variable( tree, "op_type", false, 0, hive::protocol::operation::count() - 1 );
+  slots.op_type = betree_add_integer_variable( tree, STINGER_ATTR_OP_TYPE, false, 0, hive::protocol::operation::count() - 1 );
   // operation_get_impacted_accounts of the op
-  betree_add_string_list_variable( tree, "impacted_accounts", false, SIZE_MAX );
+  slots.impacted_accounts = betree_add_string_list_variable( tree, STINGER_ATTR_IMPACTED_ACCOUNTS, false, SIZE_MAX );
   // primary asset of ops that carry one: amount in satoshis + symbol name;
   // undefined for ops without an asset
-  betree_add_integer_variable( tree, "amount", true, 0, INT64_MAX );
-  betree_add_string_variable( tree, "symbol", true, SIZE_MAX );
+  slots.amount = betree_add_integer_variable( tree, STINGER_ATTR_AMOUNT, true, 0, INT64_MAX );
+  slots.symbol = betree_add_string_variable( tree, STINGER_ATTR_SYMBOL, true, SIZE_MAX );
   // custom_json_operation id; undefined for other op types
-  betree_add_string_variable( tree, "custom_id", true, SIZE_MAX );
+  slots.custom_id = betree_add_string_variable( tree, STINGER_ATTR_CUSTOM_ID, true, SIZE_MAX );
+
+  return slots;
 }
 
 } // detail
@@ -180,12 +287,13 @@ void stinger_plugin::plugin_startup()
     ilog( "stinger: plugin_startup() begin" );
     my->_matcher.reset( betree_make() );
     FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
-    detail::declare_rule_attributes( my->_matcher.get() );
+    my->_slots = detail::declare_rule_attributes( my->_matcher.get() );
     for( const auto& rule : my->rules.rules )
     {
       FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
         "stinger: rule \"${n}\" (id ${i}) failed to parse: ${e}",
         ("n", rule.name)("i", rule.id)("e", rule.match) );
+      my->_rules_by_id.emplace( rule.id, &rule );
     }
     ilog( "stinger: subscription index built, ${n} rule(s)", ("n", my->rules.rules.size()) );
     ilog( "stinger: plugin_startup() end" );
