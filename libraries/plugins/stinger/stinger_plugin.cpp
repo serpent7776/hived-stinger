@@ -109,9 +109,9 @@ public:
   fc::path                      rules_file;
   rules_config                  rules;
 
-  /// be-tree subscription index; built once in plugin_startup, then read-only
-  /// on the writer thread (this be-tree fork has no subscription deletion, so
-  /// dynamic rule reload means rebuilding the index).
+  /// be-tree subscription index; built once in plugin_initialize - replay
+  /// delivers operation notifications during the chain plugin's startup,
+  /// before this plugin's plugin_startup runs
   std::unique_ptr< betree, decltype( &betree_free ) > _matcher{ nullptr, &betree_free };
 
   /// event variable indices assigned by declare_rule_attributes for _matcher
@@ -267,6 +267,19 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     ilog( "stinger: loaded ${n} rule(s) from ${f}",
       ("n", my->rules.rules.size())("f", my->rules_file.generic_string()) );
 
+    // the index must be ready before any signal handler is connected
+    my->_matcher.reset( betree_make() );
+    FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
+    my->_slots = detail::declare_rule_attributes( my->_matcher.get() );
+    for( const auto& rule : my->rules.rules )
+    {
+      FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
+        "stinger: rule \"${n}\" (id ${i}) failed to parse: ${e}",
+        ("n", rule.name)("i", rule.id)("e", rule.match) );
+      my->_rules_by_id.emplace( rule.id, &rule );
+    }
+    ilog( "stinger: subscription index built, ${n} rule(s)", ("n", my->rules.rules.size()) );
+
     my->post_apply_operation_connection = my->_db.add_post_apply_operation_handler(
       [&]( const operation_notification& note ) { try { my->on_post_apply_operation( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
     my->post_apply_block_connection = my->_db.add_post_apply_block_handler(
@@ -282,22 +295,7 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
 
 void stinger_plugin::plugin_startup()
 {
-  try
-  {
-    ilog( "stinger: plugin_startup() begin" );
-    my->_matcher.reset( betree_make() );
-    FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
-    my->_slots = detail::declare_rule_attributes( my->_matcher.get() );
-    for( const auto& rule : my->rules.rules )
-    {
-      FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
-        "stinger: rule \"${n}\" (id ${i}) failed to parse: ${e}",
-        ("n", rule.name)("i", rule.id)("e", rule.match) );
-      my->_rules_by_id.emplace( rule.id, &rule );
-    }
-    ilog( "stinger: subscription index built, ${n} rule(s)", ("n", my->rules.rules.size()) );
-    ilog( "stinger: plugin_startup() end" );
-  } FC_CAPTURE_AND_RETHROW()
+  // nothing to do
 }
 
 void stinger_plugin::plugin_shutdown()
