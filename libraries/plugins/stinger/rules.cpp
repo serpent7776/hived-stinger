@@ -39,27 +39,15 @@ void check_rule_object( const fc::variant& var, size_t index )
   require_key( rule, "match", what );
   require_key( rule, "exec", what );
   FC_ASSERT( rule[ "exec" ].is_object(), "exec of ${w} is not a JSON object", ("w", what) );
-  reject_unknown_keys( rule[ "exec" ].get_object(), { "type", "url" }, "exec of " + what );
+  reject_unknown_keys( rule[ "exec" ].get_object(), { "type" }, "exec of " + what );
   if( rule.contains( "enrich" ) )
     FC_ASSERT( rule[ "enrich" ].is_array(), "enrich of ${w} is not a JSON array", ("w", what) );
 }
 
 void check_exec( const exec_definition& exec, const std::string& what )
 {
-  if( exec.type == "log" )
-  {
-    FC_ASSERT( !exec.url, "log exec of ${w} takes no \"url\"", ("w", what) );
-  }
-  else if( exec.type == "webhook" )
-  {
-    FC_ASSERT( exec.url, "webhook exec of ${w} requires a \"url\"", ("w", what) );
-    FC_ASSERT( exec.url->rfind( "http://", 0 ) == 0 || exec.url->rfind( "https://", 0 ) == 0,
-      "webhook url \"${u}\" of ${w} must start with http:// or https://", ("u", *exec.url)("w", what) );
-  }
-  else
-  {
-    FC_ASSERT( false, "unknown exec type \"${t}\" in ${w} (known: log, webhook)", ("t", exec.type)("w", what) );
-  }
+  FC_ASSERT( exec.type == "log",
+    "unknown exec type \"${t}\" in ${w} (known: log)", ("t", exec.type)("w", what) );
 }
 
 } // anonymous namespace

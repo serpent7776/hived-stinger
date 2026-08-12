@@ -38,7 +38,7 @@ BOOST_AUTO_TEST_CASE( valid_rules_file )
         { "name": "large-transfer", "match": "op_type = 2 and amount > 1000000",
           "exec": { "type": "log" } },
         { "name": "sl-market", "match": "op_type = 18 and custom_id = \"sm_market\"",
-          "exec": { "type": "webhook", "url": "https://example.com/hook" } }
+          "exec": { "type": "log" } }
       ]
     } )" );
 
@@ -49,10 +49,8 @@ BOOST_AUTO_TEST_CASE( valid_rules_file )
   BOOST_CHECK_EQUAL( config.rules[0].name, name );
   BOOST_CHECK_EQUAL( config.rules[0].match, "op_type = 2 and amount > 1000000" );
   BOOST_CHECK_EQUAL( config.rules[0].exec.type, "log" );
-  BOOST_CHECK( !config.rules[0].exec.url );
-  BOOST_CHECK_EQUAL( config.rules[1].exec.type, "webhook" );
-  BOOST_REQUIRE( config.rules[1].exec.url );
-  BOOST_CHECK_EQUAL( *config.rules[1].exec.url, "https://example.com/hook" );
+  BOOST_CHECK_EQUAL( config.rules[1].name, "sl-market" );
+  BOOST_CHECK_EQUAL( config.rules[1].exec.type, "log" );
 }
 
 BOOST_AUTO_TEST_CASE( empty_rules_list_is_valid )
@@ -127,17 +125,6 @@ BOOST_AUTO_TEST_CASE( malformed_execs )
   // unknown exec type
   BOOST_REQUIRE_THROW( load_from_text( dir,
     R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": "carrier-pigeon" } } ] } )" ), fc::exception );
-  // webhook without url
-  BOOST_REQUIRE_THROW( load_from_text( dir,
-    R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": "webhook" } } ] } )" ), fc::exception );
-  // webhook with a non-http url
-  BOOST_REQUIRE_THROW( load_from_text( dir,
-    R"( { "rules": [ { "name": "r", "match": "op_type = 2",
-                       "exec": { "type": "webhook", "url": "ftp://example.com" } } ] } )" ), fc::exception );
-  // log exec takes no url
-  BOOST_REQUIRE_THROW( load_from_text( dir,
-    R"( { "rules": [ { "name": "r", "match": "op_type = 2",
-                       "exec": { "type": "log", "url": "https://example.com" } } ] } )" ), fc::exception );
   // unknown exec key
   BOOST_REQUIRE_THROW( load_from_text( dir,
     R"( { "rules": [ { "name": "r", "match": "op_type = 2",
