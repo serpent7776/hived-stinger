@@ -88,6 +88,8 @@ add_boost_test( plugin_test
     json_rpc/semantics_validation
     market_history/mh_test:142
     transaction_status/transaction_status_test
+    stinger_rules
+    stinger_page_buffer
 )
 
 # needed to correctly print crash stacktrace
