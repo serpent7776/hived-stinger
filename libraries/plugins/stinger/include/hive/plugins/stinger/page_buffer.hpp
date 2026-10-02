@@ -102,9 +102,7 @@ public:
     _free_count = page_count + 2;
 
     // wire page 0: the producer starts on the last free page
-    _page  = _free[ --_free_count ];
-    _write = _page + sizeof( page_header );
-    _end   = _page + _page_size;
+    _page.open( _free[ --_free_count ], _page_size );
   }
 
   page_buffer( const page_buffer& ) = delete;
@@ -136,10 +134,10 @@ public:
     FC_ASSERT( len > 0, "frame must not be empty" );
     FC_ASSERT( len <= capacity(), "frame of ${len} bytes exceeds page capacity ${cap}",
                ( "len", len )( "cap", capacity() ) );
-    if( len > size_t( _end - _write ) )
+    if( len > _page.room() )
       rotate();
-    std::memcpy( _write, frame, len );
-    _write += len;
+    std::memcpy( _page.write, frame, len );
+    _page.write += len;
     ++_frames;                     // plain producer-private counters - no
     _bytes += len;                 // lock, no atomics on the per-frame path
   }
@@ -151,14 +149,15 @@ public:
    */
   void rotate()
   {
-    if( _write == _page + sizeof( page_header ) )
+    if( _page.empty() )
       return;                                  // empty page: nothing to hand over
 
-    page_header* h = reinterpret_cast< page_header* >( _page );  // stamp OUTSIDE the lock
+    page_header* h = reinterpret_cast< page_header* >( _page.begin );  // stamp OUTSIDE the lock
     h->page_index  = _cur;
-    h->used        = uint32_t( _write - ( _page + sizeof( page_header ) ) );
+    h->used        = uint32_t( _page.used() );
     h->reserved    = 0;
 
+    std::byte* fresh;
     {
       std::lock_guard< std::mutex > g( _mx );
       if( _ready_count == _page_count )        // full: newest-wins, evict the oldest
@@ -166,19 +165,18 @@ public:
         _free[ _free_count++ ] = ready_pop_front();
         ++_pages_dropped;                      // exact accounting, at the drop site
       }
-      ready_push_back( _page );
+      ready_push_back( _page.begin );
       // The free stack cannot be empty here: we just pushed our page
       // (holding none), the eviction capped |ready| <= N, the consumer
       // holds at most 1, so by conservation |free| >= (N+2) - N - 1 = 1.
       assert( _free_count > 0 );
-      _page = _free[ --_free_count ];
+      fresh = _free[ --_free_count ];
       ++_pages_published;
       _frames_total = _frames;                 // fold the metrics, once per page
       _bytes_total  = _bytes;
     }
     ++_cur;
-    _write = _page + sizeof( page_header );
-    _end   = _page + _page_size;
+    _page.open( fresh, _page_size );
   }
 
   // ---- consumer (single sink thread) ----
@@ -198,7 +196,7 @@ public:
   std::byte* take( std::byte* finished )
   {
     bool handed_back_held_page;
-    std::byte* page = nullptr;
+    std::byte* taken = nullptr;
     {
       std::lock_guard< std::mutex > g( _mx );
       handed_back_held_page = finished == _taken;
@@ -207,12 +205,12 @@ public:
         if( finished )
           _free[ _free_count++ ] = finished;
         _taken = _ready_count == 0 ? nullptr : ready_pop_front();
-        page = _taken;
+        taken = _taken;
       }
     }
     // checked under the lock, reported OUTSIDE it: a failing FC_ASSERT allocates
     FC_ASSERT( handed_back_held_page, "take() must be handed the page the previous take() returned" );
-    return page;
+    return taken;
   }
 
   // ---- shutdown ----
@@ -259,6 +257,33 @@ public:
   }
 
 private:
+  /// The page the producer is filling: where it starts, where the next frame
+  /// goes and where it ends.
+  struct page
+  {
+    /// first byte of the page; the header is stamped here in rotate()
+    std::byte* begin = nullptr;
+    /// append cursor: the next free byte
+    std::byte* write = nullptr;
+    /// one past the last byte of the page
+    std::byte* end   = nullptr;
+
+    /// start filling `p`, a page of `size` bytes, right after its header
+    void open( std::byte* p, size_t size )
+    {
+      begin = p;
+      write = p + sizeof( page_header );
+      end   = p + size;
+    }
+
+    /// true while no frame has been appended
+    bool empty() const { return write == begin + sizeof( page_header ); }
+    /// frame bytes appended so far
+    size_t used() const { return size_t( write - begin ) - sizeof( page_header ); }
+    /// frame bytes that still fit
+    size_t room() const { return size_t( end - write ); }
+  };
+
   /// debug-only SPSC guard: pins the first caller as the producer and
   /// returns whether the caller is that thread; always true under NDEBUG
   bool on_writer_thread()
@@ -298,12 +323,8 @@ private:
 
   /// the producer thread, pinned on first append; debug-only SPSC guard
   alignas( 64 ) std::thread::id _writer{};
-  /// start of the page being filled; its header is stamped here in rotate()
-  std::byte* _page  = nullptr;
-  /// append cursor: the next free byte in the current page
-  std::byte* _write = nullptr;
-  /// one past the last byte of the current page
-  std::byte* _end   = nullptr;
+  /// the page being filled
+  page       _page;
   /// monotonic page index == pages published; stamped into the header
   uint64_t   _cur    = 0;
   /// frames appended since construction
