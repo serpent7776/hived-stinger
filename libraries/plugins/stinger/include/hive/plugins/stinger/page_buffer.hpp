@@ -294,9 +294,12 @@ private:
   /// N: capacity of the ready ring; a power of two, so it masks ring indices
   const size_t _page_count;
 
-  // producer-private, never touched by the consumer
-  std::thread::id _writer{};        // pinned on first append; debug-only SPSC guard
-  std::byte* _page  = nullptr;      // append cursor lives in the current page
+  // producer-private, never touched by the consumer; on its own cache line
+
+  /// the producer thread, pinned on first append; debug-only SPSC guard
+  alignas( 64 ) std::thread::id _writer{};
+  /// start of the page being filled; its header is stamped here in rotate()
+  std::byte* _page  = nullptr;
   /// append cursor: the next free byte in the current page
   std::byte* _write = nullptr;
   /// one past the last byte of the current page
@@ -310,8 +313,11 @@ private:
 
   // everything below is touched only under _mx; critical sections are a
   // handful of pointer/index ops - nothing blocking, no allocation, ever
-  std::mutex _mx;
-  std::vector< std::byte* > _ready; // fixed ring: filled pages awaiting the sink
+
+  /// guards every member below it
+  alignas( 64 ) std::mutex _mx;
+  /// fixed ring of N slots: filled pages awaiting the sink
+  std::vector< std::byte* > _ready;
   /// slot of the oldest ready page
   size_t     _ready_head  = 0;
   /// number of ready pages, 0..N
