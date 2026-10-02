@@ -516,6 +516,27 @@ plugin_test_api:
     when: always
     expire_in: 1 week
 
+# Concurrency tests of the stinger page buffer: a standalone binary, run
+# natively and then under both valgrind race detectors.
+# - --fair-sched=yes keeps valgrind's scheduler from starving the sink thread
+# - valgrind comes with ci-base-image
+
+stinger_page_buffer_concurrency_test:
+  extends: .unit_tests_base
+  script:
+    - timeout 5m ./hived-testnet-binaries/stinger_page_buffer_concurrency_test --log_format=JUNIT --log_sink=stinger_page_buffer_concurrency_results.xml --log_level=error > stinger_page_buffer_concurrency.log 2>&1
+    - timeout 10m valgrind --tool=helgrind --fair-sched=yes --error-exitcode=1 ./hived-testnet-binaries/stinger_page_buffer_concurrency_test > stinger_page_buffer_concurrency_helgrind.log 2>&1
+    - timeout 10m valgrind --tool=drd --fair-sched=yes --error-exitcode=1 ./hived-testnet-binaries/stinger_page_buffer_concurrency_test > stinger_page_buffer_concurrency_drd.log 2>&1
+  artifacts:
+    reports:
+      junit: stinger_page_buffer_concurrency_results.xml
+    paths:
+      - stinger_page_buffer_concurrency.log
+      - stinger_page_buffer_concurrency_helgrind.log
+      - stinger_page_buffer_concurrency_drd.log
+    when: always
+    expire_in: 1 week
+
 # Verify binaries are statically linked (except for expected glibc dependencies)
 # This ensures binaries are portable across Linux distributions
 static_linking_check:
