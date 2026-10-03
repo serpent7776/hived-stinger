@@ -86,19 +86,17 @@ public:
                "page size must not exceed 4 GiB" );
     FC_ASSERT( page_count >= 2 && ( page_count & ( page_count - 1 ) ) == 0,
                "page count must be a power of two, at least 2" );
+    FC_ASSERT( page_count + 2 <= std::numeric_limits< size_t >::max() / page_size,
+               "total size of the pages must fit size_t" );
 
-    // All N+2 pages are allocated individually, prefaulted so the first lap
-    // takes no minor faults on the writer thread, and pass through the free
-    // stack.
+    // All N+2 pages are slices of one allocation, zeroed by make_unique and
+    // so prefaulted - the first lap takes no minor faults on the writer
+    // thread - and pass through the free stack.
     _ready.resize( page_count, nullptr );
     _free.resize( page_count + 2, nullptr );
-    _storage.reserve( page_count + 2 );
+    _storage = std::make_unique< std::byte[] >( ( page_count + 2 ) * page_size );
     for( size_t i = 0; i < page_count + 2; ++i )
-    {
-      _storage.emplace_back( new std::byte[ page_size ] );
-      std::memset( _storage.back().get(), 0, page_size );
-      _free[ i ] = _storage.back().get();
-    }
+      _free[ i ] = _storage.get() + i * page_size;
     _free_count = page_count + 2;
 
     // wire page 0: the producer starts on the last free page
@@ -371,8 +369,8 @@ private:
   /// set by stop(): the stream has ended
   bool       _stop = false;
 
-  /// owns the N+2 pages; written at construction, immutable after
-  std::vector< std::unique_ptr< std::byte[] > > _storage;
+  /// owns the N+2 pages as one block; written at construction, immutable after
+  std::unique_ptr< std::byte[] > _storage;
 };
 
 } } } // hive::plugins::stinger
