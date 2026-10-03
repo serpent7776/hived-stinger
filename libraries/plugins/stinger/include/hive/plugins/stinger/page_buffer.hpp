@@ -103,6 +103,7 @@ public:
 
     // wire page 0: the producer starts on the last free page
     _page.open( _free[ --_free_count ], _page_size );
+    assert( pages_conserved() );
   }
 
   page_buffer( const page_buffer& ) = delete;
@@ -174,6 +175,7 @@ public:
       ++_pages_published;
       _frames_total = _frames;                 // fold the metrics, once per page
       _bytes_total  = _bytes;
+      assert( pages_conserved() );
     }
     ++_cur;
     _page.open( fresh, _page_size );
@@ -207,6 +209,7 @@ public:
         _taken = _ready_count == 0 ? nullptr : ready_pop_front();
         taken = _taken;
       }
+      assert( pages_conserved() );
     }
     // checked under the lock, reported OUTSIDE it: a failing FC_ASSERT allocates
     FC_ASSERT( handed_back_held_page, "take() must be handed the page the previous take() returned" );
@@ -312,6 +315,14 @@ private:
   {
     _ready[ ( _ready_head + _ready_count ) & ( _page_count - 1 ) ] = p;
     ++_ready_count;
+  }
+
+  /// true if all N+2 pages are accounted for: ready, free, the one the
+  /// producer is filling and the one the consumer may hold; caller holds _mx
+  /// and the producer holds a page (not mid-rotate)
+  bool pages_conserved() const
+  {
+    return _ready_count + _free_count + 1 + ( _taken ? 1 : 0 ) == _page_count + 2;
   }
 
   /// bytes per page, header included; a power of two
