@@ -9,7 +9,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace hive { namespace plugins { namespace stinger {
@@ -28,6 +30,8 @@ struct page_header
   uint32_t reserved;
 };
 static_assert( sizeof( page_header ) == 16, "page header must be 16 bytes" );
+static_assert( std::is_trivially_destructible_v< page_header >,
+               "page header is placement-new'd into the page and never destroyed" );
 
 /**
  * Single-producer / single-consumer transport of preallocated pages.
@@ -151,10 +155,10 @@ public:
     if( _page.empty() )
       return;                                  // empty page: nothing to hand over
 
-    page_header* h = reinterpret_cast< page_header* >( _page.begin );  // stamp OUTSIDE the lock
-    h->page_index  = _cur;
-    h->used        = uint32_t( _page.used() );
-    h->reserved    = 0;
+    page_header& h = _page.header();           // stamp OUTSIDE the lock
+    h.page_index   = _cur;
+    h.used         = uint32_t( _page.used() );
+    h.reserved     = 0;
 
     std::byte* fresh;
     {
@@ -272,11 +276,14 @@ private:
     /// start filling `p`, a page of `size` bytes, right after its header
     void open( std::byte* p, size_t size )
     {
+      new( p ) page_header{};        // the header is a real object from here on
       begin = p;
       write = p + sizeof( page_header );
       end   = p + size;
     }
 
+    /// the page's header, created by open()
+    page_header& header() const { return *std::launder( reinterpret_cast< page_header* >( begin ) ); }
     /// true while no frame has been appended
     bool empty() const { return write == begin + sizeof( page_header ); }
     /// frame bytes appended so far
