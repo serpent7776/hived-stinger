@@ -101,8 +101,12 @@ target_link_libraries( plugin_test db_fixture hive_chain hive_protocol account_h
 # linking only fc (no chain libraries, no tcmalloc) it starts quickly under
 # valgrind --tool=helgrind / --tool=drd, and it can be built with
 # ThreadSanitizer on its own, without instrumenting the whole tree.
+# The header-only page buffer is compiled into it with UBSan checks in trap
+# mode: undefined behaviour kills the test with SIGILL, natively and under
+# valgrind alike, and no libubsan is needed (ci-base-image has no 64-bit one).
 function( add_stinger_concurrency_test _name )
    add_executable( ${_name} ${ARGN} stinger_concurrency_tests/page_buffer_concurrency_tests.cpp )
+   target_compile_options( ${_name} PRIVATE -fsanitize=undefined -fsanitize-trap=undefined )
    target_include_directories( ${_name} PRIVATE $<TARGET_PROPERTY:stinger_plugin,INTERFACE_INCLUDE_DIRECTORIES> )
    target_link_libraries( ${_name} fc )
 endfunction()

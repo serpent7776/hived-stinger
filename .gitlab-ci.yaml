@@ -519,6 +519,8 @@ plugin_test_api:
 # Concurrency tests of the stinger page buffer: a standalone binary, run
 # natively and then under both valgrind race detectors.
 # - --fair-sched=yes keeps valgrind's scheduler from starving the sink thread
+# - the binary carries UBSan checks in trap mode, so undefined behaviour fails
+#   any of the three runs with SIGILL
 # - valgrind comes with ci-base-image
 
 stinger_page_buffer_concurrency_test:
