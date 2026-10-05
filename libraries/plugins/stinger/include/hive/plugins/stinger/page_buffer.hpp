@@ -1,8 +1,10 @@
 #pragma once
 
 #include <fc/exception/exception.hpp>
+#include <fc/log/logger.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -158,12 +160,14 @@ public:
     _page.stamp( _cur );                       // stamp OUTSIDE the lock
 
     std::byte* fresh;
+    uint64_t dropped_total = 0;                // 0: this rotate() dropped nothing
     {
       std::lock_guard< std::mutex > g( _mx );
       if( _ready_count == _page_count )        // full: newest-wins, evict the oldest
       {
         _free[ _free_count++ ] = ready_pop_front();
         ++_pages_dropped;                      // exact accounting, at the drop site
+        dropped_total = _pages_dropped;        // reported OUTSIDE the lock
       }
       ready_push_back( _page.begin );
       // The free stack cannot be empty here: we just pushed our page
@@ -178,6 +182,20 @@ public:
     }
     ++_cur;
     _page.open( fresh, _page_size );
+
+    // Rate-limited, not one line per page: a stalled consumer makes every
+    // rotate() drop. The clock is read on the drop path only.
+    if( dropped_total != 0 )
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if( _drops_logged == 0 || now - _drop_log_time >= DROP_LOG_INTERVAL )
+      {
+        wlog( "stinger: page buffer full, consumer is behind - dropped ${n} page(s), ${t} in total",
+              ("n", dropped_total - _drops_logged)("t", dropped_total) );
+        _drops_logged  = dropped_total;
+        _drop_log_time = now;
+      }
+    }
   }
 
   // ---- consumer (single sink thread) ----
@@ -259,6 +277,9 @@ public:
   }
 
 private:
+  /// drops are reported at most this often
+  static constexpr std::chrono::seconds DROP_LOG_INTERVAL{ 10 };
+
   /// The page the producer is filling: where it starts, where the next frame
   /// goes and where it ends.
   struct page
@@ -352,6 +373,10 @@ private:
   uint64_t   _frames = 0;
   /// frame bytes appended since construction
   uint64_t   _bytes  = 0;
+  /// _pages_dropped as of the last drop warning
+  uint64_t   _drops_logged = 0;
+  /// when the last drop warning was logged
+  std::chrono::steady_clock::time_point _drop_log_time{};
 
   // everything below is touched only under _mx; critical sections are a
   // handful of pointer/index ops - nothing blocking, no allocation, ever
