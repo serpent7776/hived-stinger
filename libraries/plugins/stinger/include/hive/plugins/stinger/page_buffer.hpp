@@ -155,10 +155,7 @@ public:
     if( _page.empty() )
       return;                                  // empty page: nothing to hand over
 
-    page_header& h = _page.header();           // stamp OUTSIDE the lock
-    h.page_index   = _cur;
-    h.used         = uint32_t( _page.used() );
-    h.reserved     = 0;
+    _page.stamp( _cur );                       // stamp OUTSIDE the lock
 
     std::byte* fresh;
     {
@@ -284,6 +281,14 @@ private:
 
     /// the page's header, created by open()
     page_header& header() const { return *std::launder( reinterpret_cast< page_header* >( begin ) ); }
+    /// fill in the header before the page is published as page `index`
+    void stamp( uint64_t index )
+    {
+      page_header& h = header();
+      h.page_index   = index;
+      h.used         = uint32_t( used() );
+      h.reserved     = 0;
+    }
     /// true while no frame has been appended
     bool empty() const { return write == begin + sizeof( page_header ); }
     /// frame bytes appended so far
