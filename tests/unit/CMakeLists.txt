@@ -90,6 +90,7 @@ add_boost_test( plugin_test
     transaction_status/transaction_status_test
     stinger_rules
     stinger_page_buffer
+    stinger_frame
 )
 
 # needed to correctly print crash stacktrace
