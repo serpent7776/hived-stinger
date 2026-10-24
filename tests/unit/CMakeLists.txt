@@ -89,7 +89,6 @@ add_boost_test( plugin_test
     market_history/mh_test:142
     transaction_status/transaction_status_test
     stinger_rules
-    stinger_page_buffer
     stinger_frame
 )
 
@@ -97,28 +96,6 @@ add_boost_test( plugin_test
 set_target_properties(plugin_test PROPERTIES ENABLE_EXPORTS true)
 
 target_link_libraries( plugin_test db_fixture hive_chain hive_protocol account_history_rocksdb_plugin market_history_plugin witness_plugin debug_node_plugin condenser_api_plugin database_api_plugin transaction_status_plugin transaction_status_api_plugin metadata_plugin stinger_plugin fc ${PLATFORM_SPECIFIC_LIBS} block_log_info_plugin hive_plugins )
-
-# Concurrency tests of the stinger page buffer are a standalone executable:
-# linking only fc (no chain libraries, no tcmalloc) it starts quickly under
-# valgrind --tool=helgrind / --tool=drd, and it can be built with
-# ThreadSanitizer on its own, without instrumenting the whole tree.
-# The header-only page buffer is compiled into it with UBSan checks in trap
-# mode: undefined behaviour kills the test with SIGILL, natively and under
-# valgrind alike, and no libubsan is needed (ci-base-image has no 64-bit one).
-function( add_stinger_concurrency_test _name )
-   add_executable( ${_name} ${ARGN} stinger_concurrency_tests/page_buffer_concurrency_tests.cpp )
-   target_compile_options( ${_name} PRIVATE -fsanitize=undefined -fsanitize-trap=undefined )
-   target_include_directories( ${_name} PRIVATE $<TARGET_PROPERTY:stinger_plugin,INTERFACE_INCLUDE_DIRECTORIES> )
-   target_link_libraries( ${_name} fc )
-endfunction()
-
-add_stinger_concurrency_test( stinger_page_buffer_concurrency_test )
-add_test( NAME unit/stinger_page_buffer_concurrency COMMAND stinger_page_buffer_concurrency_test )
-
-# the ThreadSanitizer build is not part of `all`; build the target on demand
-add_stinger_concurrency_test( stinger_page_buffer_concurrency_test_tsan EXCLUDE_FROM_ALL )
-target_compile_options( stinger_page_buffer_concurrency_test_tsan PRIVATE -fsanitize=thread )
-target_link_options( stinger_page_buffer_concurrency_test_tsan PRIVATE -fsanitize=thread )
 
 if(MSVC)
   set_source_files_properties( tests/serialization_tests.cpp PROPERTIES COMPILE_FLAGS "/bigobj" )

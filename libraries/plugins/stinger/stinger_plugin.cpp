@@ -1,7 +1,6 @@
 #include <hive/chain/hive_fwd.hpp>
 
 #include <hive/plugins/stinger/frame.hpp>
-#include <hive/plugins/stinger/page_buffer.hpp>
 #include <hive/plugins/stinger/rules.hpp>
 #include <hive/plugins/stinger/stinger_plugin.hpp>
 
@@ -23,14 +22,18 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
 
@@ -46,14 +49,31 @@ constexpr const char* STINGER_ATTR_AMOUNT            = "amount";
 constexpr const char* STINGER_ATTR_SYMBOL            = "symbol";
 constexpr const char* STINGER_ATTR_CUSTOM_ID         = "custom_id";
 
-/// page geometry of the match stream: 1 MiB pages, 16 in the ready ring
-/// (18 MiB with the producer's and the consumer's page); config knobs later
-constexpr size_t STINGER_PAGE_SIZE  = size_t( 1 ) << 20;
-constexpr size_t STINGER_PAGE_COUNT = 16;
+/// The largest match frame the encoder builds: the block size ceiling, which
+/// bounds any operation in a block, plus the overhead of a frame carrying as
+/// many rule ids as the header can count. So a body only ever fails to fit
+/// (and is left out, flagged) for a virtual operation beyond anything the
+/// chain generates, however many rules match it. Allocated once, on the
+/// writer thread.
+constexpr size_t STINGER_FRAME_BUDGET =
+  size_t( HIVE_MAX_BLOCK_SIZE ) + match_frame_overhead( std::numeric_limits< uint16_t >::max() );
 
-/// the sink thread's idle poll interval backs off between these two
-constexpr std::chrono::microseconds SINK_IDLE_MIN{ 200 };
-constexpr std::chrono::microseconds SINK_IDLE_MAX{ 2000 };
+/// Irreversible blocks the writer holds for the sink before dropping the
+/// oldest: the writer never waits for the sink. At one block per 3 seconds
+/// this is about 50 minutes of sink outage; config knob later.
+constexpr size_t STINGER_READY_BLOCKS_MAX = 1024;
+
+/// drops are reported at most this often
+constexpr std::chrono::seconds DROP_LOG_INTERVAL{ 10 };
+
+/// One block's match frames, back to back, as the writer sealed them. Built
+/// on the writer thread, handed to the sink once the block is irreversible.
+struct block_matches
+{
+  uint32_t                 block_num = 0;
+  uint32_t                 frames    = 0;
+  std::vector< std::byte > bytes;
+};
 
 /// be-tree event variable ids as returned by betree_add_*_variable, used as betree_set_variable slots
 struct event_slots
@@ -93,33 +113,26 @@ struct event_attribute_visitor
 };
 
 /**
- * Stateless stream emitter: matches each operation against the be-tree rule
- * index and forwards results plus chain lifecycle signals as one ordered event
- * stream. Fork handling is the consumer's job; the stream carries everything
- * needed for it:
+ * Matches each operation against the be-tree rule index and delivers the
+ * matches of a block once that block is irreversible. Consumers never see a
+ * match that can be undone, so there is no fork handling on their side and
+ * the stream carries match frames only (frame.hpp).
  *
- *   match          { rule name, block_num, trx_in_block, op_in_trx, virtual_op }
- *   block_applied  { block_num, block_id }   - seals a block; carries the id
- *                                              that identifies its branch
- *   switch_fork    { new_head_block_num }    - discard held state above N
- *   irreversible   { block_num }             - everything <= N is final
+ * The reversible window is the plugin's: a block's match frames accumulate
+ * in _current while it is applied, are sealed into _pending at
+ * post_apply_block, dropped on fail_apply_block (the block was rolled back
+ * mid-application; its leading transactions had already matched) and on
+ * switch_fork (everything above the new head), and released to the sink at
+ * irreversible_block. With one-block irreversibility the window is normally
+ * one block deep. All of that state is touched on the writer thread only;
+ * the one cross-thread point is the release, a mutex-guarded queue the sink
+ * waits on. The writer never blocks on the sink: a full queue drops the
+ * oldest block, counted and warned about.
  *
- * Events are emitted in signal order on the writer thread; sinks must preserve
- * that order per subscriber. A consumer wanting safe delivery buffers matches
- * per block until irreversible and drops them on switch_fork; one wanting
- * lowest latency acts on match and compensates on switch_fork.
- *
- * A block that fails mid-application is the one non-fork way a block's
- * matches can be undone: its leading transactions have already emitted
- * matches when a later one throws and the block's state is rolled back.
- * fail_apply_block reports it as switch_fork{ block_num - 1 }, which
- * already means "discard everything above"; no block_applied follows.
- *
- * Delivery is off the writer thread: a handler packs its event into a frame
- * (frame.hpp) and appends it to the page buffer; a page is handed over at a
- * block boundary or when full, and the sink thread decodes it and delivers
- * it. The writer thread never blocks on the sink - a full ring drops the
- * oldest page, counted.
+ * Matches held at shutdown - blocks applied but not yet irreversible - are
+ * dropped and their block numbers logged: a restart replays those blocks
+ * with matching off, so they are never delivered. Normally zero or one
+ * block.
  */
 class stinger_plugin_impl
 {
@@ -139,10 +152,10 @@ public:
 
   /// the sink thread's body
   void sink_loop();
-  /// deliver every frame of one taken page
-  void deliver_page( const std::byte* page );
+  /// deliver every frame of one irreversible block
+  void deliver_block( const block_matches& b );
   void deliver_match( const match_frame& m );
-  /// stop producing, flush the current page, stop and join the sink; idempotent
+  /// stop producing, drop what is not irreversible, stop and join the sink; idempotent
   void stop_sink();
 
   plugins::chain::chain_plugin& _chain_plugin;
@@ -163,33 +176,50 @@ public:
   /// thread afterwards and never written again
   std::map< uint64_t, const rule_definition* > _rules_by_id;
 
-  /// the match stream's pages: appended on the writer thread, taken by the sink
-  std::unique_ptr< page_buffer >   _pages;
-  /// the writer thread's frame scratch; sized to a page's capacity
+  /// the writer thread's frame scratch
   std::unique_ptr< frame_encoder > _encoder;
+
+  /// writer-private: the block being applied, and the sealed blocks that
+  /// are not irreversible yet, in ascending block order
+  block_matches               _current;
+  std::deque< block_matches > _pending;
+  /// writer-private counters, folded into the shutdown report
+  uint64_t _blocks_released = 0;
+  uint64_t _frames_released = 0;
+  uint64_t _blocks_dropped  = 0;
+  /// _blocks_dropped as of the last drop warning, and when it was logged
+  uint64_t                              _drops_logged = 0;
+  std::chrono::steady_clock::time_point _drop_log_time{};
+
+  /// the release point: irreversible blocks the sink has not taken yet.
+  /// _ready_stopped is set by stop_sink() after the final release
+  std::mutex                  _ready_mutex;
+  std::condition_variable     _ready_cv;
+  std::deque< block_matches > _ready;
+  bool                        _ready_stopped = false;
   /// the sink thread; a plain std::thread, not scheduled against appbase
   std::thread                      _sink;
 
   /// Handshake between the signal handlers on the writer thread and
   /// stop_sink() on the shutdown thread. signals2's disconnect() stops new
   /// invocations but does not wait for one already running, and a handler
-  /// may be mid-append when stop_sink() wants to rotate() the current page.
+  /// may be mid-way through _pending when stop_sink() wants to report it.
   /// Each handler enters by incrementing _in_handler and then checking
   /// _stopping (bailing if set); stop_sink() sets _stopping and then spins
   /// until _in_handler is 0. Both seq_cst, so the two sides cannot both miss
   /// each other: either the handler bails before touching producer state, or
   /// the spin waits for its release-decrement, which is the happens-before
-  /// edge that makes the shutdown thread's rotate() legal.
+  /// edge that lets the shutdown thread read the writer-private state.
   std::atomic< bool >     _stopping{ false };
   std::atomic< unsigned > _in_handler{ 0 };
   /// set by the sink thread if it exits on an exception: handlers stop
-  /// producing into pages nobody will drain, and stop_sink() reports it
+  /// producing for a sink that will never drain, and stop_sink() reports it
   std::atomic< bool >     _sink_failed{ false };
 
-  /// sink-private: pages taken and the index of the last one, a tripwire
-  /// for page-index arithmetic
-  uint64_t _pages_consumed = 0;
-  uint64_t _last_page_index = 0;
+  /// sink-private: blocks delivered and the number of the last one, a
+  /// tripwire for the release order
+  uint64_t _blocks_delivered = 0;
+  uint32_t _last_block_delivered = 0;
 
   chain::database::signal_connection_ptr post_apply_operation_connection;
   chain::database::signal_connection_ptr post_apply_block_connection;
@@ -201,8 +231,8 @@ public:
 /**
  * RAII side of the shutdown handshake: every handler starts with one of
  * these and returns at once when it reports inactive. A scope guard rather
- * than manual stores because handlers throw by design (the page buffer's
- * append backstop, the FC_ASSERTs around the be-tree calls) and a decrement
+ * than manual stores because handlers throw by design (the FC_ASSERTs
+ * around the be-tree calls and the frame encoder) and a decrement
  * skipped by stack unwinding would hang stop_sink() forever.
  */
 class handler_scope
@@ -290,9 +320,7 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
     return;
 
   // One match frame per operation, carrying every rule that matched it: the
-  // body is packed once and the sink fans out. The block id of the
-  // containing block is not known yet; the block_applied event that follows
-  // the block's matches carries it.
+  // body is packed once and the sink fans out.
   // Positions travel as int32 in the frame; the sources are int32 and uint32
   // in database, so only op_in_trx can be narrowed, and only by a value no
   // transaction can hold. Tripwire, not a path real traffic takes.
@@ -307,7 +335,8 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
   coords.trx_id       = note.trx_id;
   static_assert( std::is_same_v< betree_sub_t, uint64_t >, "rule ids are stored as uint64" );
   _encoder->encode_match( coords, matches->subs, matches->matched, note.op );
-  _pages->append( _encoder->data(), _encoder->size() );
+  _current.bytes.insert( _current.bytes.end(), _encoder->data(), _encoder->data() + _encoder->size() );
+  ++_current.frames;
 }
 
 void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
@@ -316,19 +345,25 @@ void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
   if( !scope )
     return;
 
-  // emit block_applied{ note.block_num, note.block_id } - seals the block's
-  // matches, binds them to a branch, and tells consumers the stream has
-  // advanced (a block with no matches is distinguishable from a stream that
-  // has not reached it). Natural flush point for batched outbound sinks.
-  if( _db.is_replaying_block() )
+  // seal the block's matches; a block without matches (every block of a
+  // replay, where matching is off) leaves nothing to seal
+  if( _current.frames == 0 )
     return;
 
-  dlog( "stinger: block ${b} ts=${ts}",
-    ("b", note.block_num)("ts", note.full_block->get_block_header().timestamp) );
+  if( !_pending.empty() && _pending.back().block_num >= note.block_num )
+  {
+    // switch_fork drops everything above the new head before the new branch
+    // is applied, so a sealed block at or above this one is a logic error;
+    // the writer thread does not throw over it, the matches are dropped
+    elog( "stinger: block ${b} sealed while block ${p} is still pending - ${n} match(es) dropped",
+      ("b", note.block_num)("p", _pending.back().block_num)("n", _current.frames) );
+    _current = block_matches{};
+    return;
+  }
 
-  // a page ends at a block boundary or when full, whichever comes first;
-  // a block without matches leaves the page empty and this is a no-op
-  _pages->rotate();
+  _current.block_num = note.block_num;
+  _pending.push_back( std::move( _current ) );
+  _current = block_matches{};
 }
 
 void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
@@ -337,10 +372,11 @@ void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
   if( !scope )
     return;
 
-  // emit switch_fork{ note.block_num - 1 } - the block's matches already in
-  // the stream belong to a block that will not exist; see the contract above.
-  // Fires only from apply_block_extended, so it is on the writer thread and
-  // never during replay.
+  // the block threw mid-application and was rolled back; whatever its
+  // leading transactions matched belongs to a block that will not exist
+  if( _current.frames != 0 )
+    dlog( "stinger: block ${b} failed to apply - ${n} match(es) dropped", ("b", note.block_num)("n", _current.frames) );
+  _current = block_matches{};
 }
 
 void stinger_plugin_impl::on_irreversible_block( uint32_t block_num )
@@ -349,16 +385,45 @@ void stinger_plugin_impl::on_irreversible_block( uint32_t block_num )
   if( !scope )
     return;
 
-  // emit irreversible{ block_num } - consumers holding matches for safe
-  // delivery release everything <= block_num.
-  //
-  // Not yet emitted. When it is, gate it: this fires for every block of a
-  // replay (migrate_irreversible_state) on the main thread, before the
-  // chain's write queue exists, while matches are suppressed. Appending from
-  // here would pin the page buffer's writer-thread check to the main thread
-  // and emit irreversible frames for blocks no match frame refers to. The
-  // guard is a live flag set in plugin_startup, which runs after the chain
-  // plugin's replay; is_validating_block() is false here even when live.
+  // release every sealed block up to and including block_num, in one
+  // critical section; _pending is ascending so they are at the front
+  size_t released = 0;
+  while( released < _pending.size() && _pending[ released ].block_num <= block_num )
+    ++released;
+  if( released == 0 )
+    return;
+
+  uint64_t dropped_total = 0;
+  {
+    std::lock_guard< std::mutex > lock( _ready_mutex );
+    for( size_t i = 0; i < released; ++i )
+    {
+      _frames_released += _pending[ i ].frames;
+      _ready.push_back( std::move( _pending[ i ] ) );
+    }
+    while( _ready.size() > STINGER_READY_BLOCKS_MAX )
+    {
+      _ready.pop_front();
+      ++_blocks_dropped;
+      dropped_total = _blocks_dropped;
+    }
+  }
+  _ready_cv.notify_one();
+  _pending.erase( _pending.begin(), _pending.begin() + released );
+  _blocks_released += released;
+
+  // reported outside the lock, rate limited; the clock is read on the drop path only
+  if( dropped_total != 0 )
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if( _drops_logged == 0 || now - _drop_log_time >= DROP_LOG_INTERVAL )
+    {
+      wlog( "stinger: sink is behind - dropped ${n} irreversible block(s) of matches, ${t} in total",
+        ("n", dropped_total - _drops_logged)("t", dropped_total) );
+      _drops_logged  = dropped_total;
+      _drop_log_time = now;
+    }
+  }
 }
 
 void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
@@ -367,14 +432,25 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   if( !scope )
     return;
 
-  // emit switch_fork{ new_head_block_num } - consumers discard (or compensate
-  // for) everything with block_num > new_head_block_num; the new branch is
-  // re-applied afterwards and its ops are matched fresh.
-  //
-  // Not yet emitted. When it is, gate it on the same live flag as
-  // on_irreversible_block: this also fires from load_state_initial_data at
-  // startup on the main thread, and when live it fires between the pops and
-  // apply_block_extended, where is_validating_block() is false.
+  // the blocks above the new head were popped; the new branch is applied
+  // afterwards and its ops are matched fresh. Fires between the pops and
+  // the first apply, when switching back after a block of the new branch
+  // failed, and at startup after the state is undone to the last
+  // irreversible block, when nothing is pending. _current is empty at all
+  // three unless a block failed without fail_apply_block, which does not
+  // happen; dropped either way
+  uint32_t frames = _current.frames;
+  size_t   blocks = 0;
+  while( !_pending.empty() && _pending.back().block_num > new_head_block_num )
+  {
+    frames += _pending.back().frames;
+    _pending.pop_back();
+    ++blocks;
+  }
+  _current = block_matches{};
+  if( blocks != 0 || frames != 0 )
+    dlog( "stinger: fork switch to block ${b} - ${k} block(s), ${n} match(es) dropped",
+      ("b", new_head_block_num)("k", blocks)("n", frames) );
 }
 
 void stinger_plugin_impl::sink_loop()
@@ -385,44 +461,35 @@ void stinger_plugin_impl::sink_loop()
     // a foreign thread on first use, and set_name is direct on the current thread
     fc::thread::current().set_name( "stinger_sink" );
 
-    std::byte* page = nullptr;
-    auto idle = SINK_IDLE_MIN;
     for( ;; )
     {
-      // Observed BEFORE take(): stop() follows the final rotate() under the
-      // same mutex, so a stop seen here followed by an empty take() means
-      // the ring is drained and nothing more can arrive. The other order
-      // could miss the last page.
-      const bool stopped = _pages->stopped();
-      page = _pages->take( page );
-      if( page )
+      block_matches b;
       {
-        idle = SINK_IDLE_MIN;
-        // a decode tripwire or a sink bug drops this page, not hived: an
-        // exception escaping a std::thread is std::terminate
-        try
-        {
-          deliver_page( page );
-        }
-        catch( const fc::exception& e )
-        {
-          elog( "stinger: sink dropped a page: ${e}", ("e", e.to_detail_string()) );
-        }
-        catch( const std::exception& e )
-        {
-          elog( "stinger: sink dropped a page: ${e}", ("e", e.what()) );
-        }
-        catch( ... )
-        {
-          elog( "stinger: sink dropped a page: unknown exception" );
-        }
-        continue;
+        std::unique_lock< std::mutex > lock( _ready_mutex );
+        _ready_cv.wait( lock, [this]() { return !_ready.empty() || _ready_stopped; } );
+        if( _ready.empty() )
+          break;  // stopped, and stop is set after the final release: drained
+        b = std::move( _ready.front() );
+        _ready.pop_front();
       }
-      if( stopped )
-        break;  // the loop only ends on an empty take: no page is held
-      // nothing ready: the producer never signals, poll with a backoff
-      std::this_thread::sleep_for( idle );
-      idle = std::min( idle * 2, SINK_IDLE_MAX );
+      // a decode tripwire or a sink bug drops this block, not hived: an
+      // exception escaping a std::thread is std::terminate
+      try
+      {
+        deliver_block( b );
+      }
+      catch( const fc::exception& e )
+      {
+        elog( "stinger: sink dropped block ${b}: ${e}", ("b", b.block_num)("e", e.to_detail_string()) );
+      }
+      catch( const std::exception& e )
+      {
+        elog( "stinger: sink dropped block ${b}: ${e}", ("b", b.block_num)("e", e.what()) );
+      }
+      catch( ... )
+      {
+        elog( "stinger: sink dropped block ${b}: unknown exception", ("b", b.block_num) );
+      }
     }
     return;
   }
@@ -441,19 +508,20 @@ void stinger_plugin_impl::sink_loop()
   _sink_failed.store( true, std::memory_order_relaxed );
 }
 
-void stinger_plugin_impl::deliver_page( const std::byte* page )
+void stinger_plugin_impl::deliver_block( const block_matches& b )
 {
-  page_reader reader( page, _pages->page_size() );
-  // indices only ever grow (dropped pages leave gaps); an index-arithmetic
-  // bug on the producer's side shows up here
-  FC_ASSERT( _pages_consumed == 0 || reader.header().page_index > _last_page_index,
-    "stinger: page ${i} delivered after page ${l}", ("i", reader.header().page_index)("l", _last_page_index) );
-  _last_page_index = reader.header().page_index;
-  ++_pages_consumed;
+  // irreversibility is monotonic and the writer releases in block order
+  FC_ASSERT( _blocks_delivered == 0 || b.block_num > _last_block_delivered,
+    "stinger: block ${b} delivered after block ${l}", ("b", b.block_num)("l", _last_block_delivered) );
+  _last_block_delivered = b.block_num;
+  ++_blocks_delivered;
 
+  frame_reader reader( b.bytes.data(), b.bytes.size() );
+  uint32_t frames = 0;
   while( reader.more() )
   {
     const frame_view f = reader.next();
+    ++frames;
     switch( f.kind() )
     {
       case frame_kind::match:
@@ -462,12 +530,14 @@ void stinger_plugin_impl::deliver_page( const std::byte* page )
       case frame_kind::block_applied:
       case frame_kind::irreversible:
       case frame_kind::switch_fork:
-        break;  // not emitted yet
+        break;  // not emitted
       default:
-        FC_THROW_EXCEPTION( fc::assert_exception, "stinger: unknown frame kind ${k} in page ${p}",
-          ("k", f.header.kind)("p", reader.header().page_index) );
+        FC_THROW_EXCEPTION( fc::assert_exception, "stinger: unknown frame kind ${k} in block ${b}",
+          ("k", f.header.kind)("b", b.block_num) );
     }
   }
+  FC_ASSERT( frames == b.frames, "stinger: block ${b} carries ${n} frame(s), sealed with ${s}",
+    ("b", b.block_num)("n", frames)("s", b.frames) );
 }
 
 void stinger_plugin_impl::deliver_match( const match_frame& m )
@@ -475,7 +545,7 @@ void stinger_plugin_impl::deliver_match( const match_frame& m )
   // the only sink for now is the log, one line per matched rule
   fc::variant op_body;
   if( m.body_omitted )
-    op_body = "<omitted: operation exceeds the page capacity>";
+    op_body = "<omitted: operation exceeds the frame budget>";
   else
     fc::to_variant( m.unpack_op(), op_body );
 
@@ -513,20 +583,37 @@ void stinger_plugin_impl::stop_sink()
   // a handler's increment that preceded its own _stopping check
   while( _in_handler.load( std::memory_order_seq_cst ) != 0 )
     std::this_thread::yield();
-  // 4. this thread is the producer now: hand over the partial current page
-  _pages->rotate();
-  // 5. the stream has ended; set after the final page was pushed
-  _pages->stop();
-  // 6. the sink exits once it has observed the stop and drained the ring
+  // 4. this thread owns the writer-private state now. What is not
+  // irreversible is not delivered; say what that was
+  const uint32_t held_frames = _current.frames;
+  if( !_pending.empty() || held_frames != 0 )
+  {
+    uint64_t frames = held_frames;
+    for( const auto& b : _pending )
+      frames += b.frames;
+    ilog( "stinger: ${k} block(s) ${a}..${z} with ${n} match(es) were not irreversible at shutdown and are not delivered",
+      ("k", _pending.size() + ( held_frames != 0 ? 1 : 0 ))
+      ("a", _pending.empty() ? 0u : _pending.front().block_num)
+      ("z", _pending.empty() ? 0u : _pending.back().block_num)("n", frames) );
+    _pending.clear();
+    _current = block_matches{};
+  }
+  // 5. the stream has ended; set after the final release, under the same
+  // mutex, so the sink's "stopped and empty" means drained
+  {
+    std::lock_guard< std::mutex > lock( _ready_mutex );
+    _ready_stopped = true;
+  }
+  _ready_cv.notify_one();
+  // 6. the sink exits once it has drained the queue
   _sink.join();
 
-  const page_buffer::stats_t s = _pages->stats();
   if( _sink_failed.load( std::memory_order_relaxed ) )
-    elog( "stinger: sink had died - ${p} page(s) published, ${c} consumed, ${d} dropped, ${f} frame(s), ${b} bytes",
-      ("p", s.pages_published)("c", _pages_consumed)("d", s.pages_dropped)("f", s.frames)("b", s.bytes) );
+    elog( "stinger: sink had died - ${r} block(s) released, ${c} delivered, ${d} dropped, ${f} match(es)",
+      ("r", _blocks_released)("c", _blocks_delivered)("d", _blocks_dropped)("f", _frames_released) );
   else
-    ilog( "stinger: sink stopped - ${p} page(s) published, ${c} consumed, ${d} dropped, ${f} frame(s), ${b} bytes",
-      ("p", s.pages_published)("c", _pages_consumed)("d", s.pages_dropped)("f", s.frames)("b", s.bytes) );
+    ilog( "stinger: sink stopped - ${r} block(s) released, ${c} delivered, ${d} dropped, ${f} match(es)",
+      ("r", _blocks_released)("c", _blocks_delivered)("d", _blocks_dropped)("f", _frames_released) );
 }
 
 /// registers the rule attributes and returns the event variable id betree assigned to each
@@ -587,14 +674,12 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     }
     ilog( "stinger: subscription index built, ${n} rule(s)", ("n", my->rules.rules.size()) );
 
-    // the pages and the sink thread must exist before the handlers connect,
-    // for the same reason as the index; the sink reads _rules_by_id, which
-    // is complete by now and never changes again
-    my->_pages   = std::make_unique< page_buffer >( detail::STINGER_PAGE_SIZE, detail::STINGER_PAGE_COUNT );
-    my->_encoder = std::make_unique< frame_encoder >( my->_pages->capacity() );
+    // the encoder and the sink thread must exist before the handlers
+    // connect, for the same reason as the index; the sink reads
+    // _rules_by_id, which is complete by now and never changes again
+    my->_encoder = std::make_unique< frame_encoder >( detail::STINGER_FRAME_BUDGET );
     my->_sink    = std::thread( [this]() { my->sink_loop(); } );
-    ilog( "stinger: sink started, ${n} page(s) of ${s} bytes",
-      ("n", my->_pages->page_count() + 2)("s", my->_pages->page_size()) );
+    ilog( "stinger: sink started, delivering matches at irreversibility" );
 
     my->post_apply_operation_connection = my->_db.add_post_apply_operation_handler(
       [&]( const operation_notification& note ) { try { my->on_post_apply_operation( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );

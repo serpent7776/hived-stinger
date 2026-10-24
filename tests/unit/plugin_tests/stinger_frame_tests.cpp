@@ -2,7 +2,6 @@
 #include <boost/test/unit_test.hpp>
 
 #include <hive/plugins/stinger/frame.hpp>
-#include <hive/plugins/stinger/page_buffer.hpp>
 
 #include <hive/protocol/operations.hpp>
 
@@ -18,8 +17,7 @@ using namespace hive::protocol;
 
 namespace {
 
-constexpr size_t TEST_PAGE_SIZE  = 4096;
-constexpr size_t TEST_PAGE_COUNT = 2;
+constexpr size_t TEST_BUDGET = 4096;
 
 match_coords sample_coords()
 {
@@ -58,14 +56,18 @@ bool same_op( const operation& a, const operation& b )
   return fc::raw::pack_to_vector( a ) == fc::raw::pack_to_vector( b );
 }
 
-/// push the encoder's current frame through a page buffer and read it back
-frame_view round_trip( page_buffer& buf, const frame_encoder& enc, const std::byte*& page )
+/// append the encoder's current frame to a block's buffer, as the writer does
+void append( std::vector< std::byte >& buf, const frame_encoder& enc )
 {
-  buf.append( enc.data(), enc.size() );
-  buf.rotate();
-  page = buf.take( nullptr );
-  BOOST_REQUIRE( page != nullptr );
-  page_reader reader( page, TEST_PAGE_SIZE );
+  buf.insert( buf.end(), enc.data(), enc.data() + enc.size() );
+}
+
+/// copy the encoder's current frame into `buf` and read it back as the only frame
+frame_view round_trip( std::vector< std::byte >& buf, const frame_encoder& enc )
+{
+  buf.clear();
+  append( buf, enc );
+  frame_reader reader( buf.data(), buf.size() );
   BOOST_REQUIRE( reader.more() );
   frame_view f = reader.next();
   BOOST_CHECK( !reader.more() );
@@ -78,8 +80,7 @@ BOOST_AUTO_TEST_SUITE( stinger_frame )
 
 BOOST_AUTO_TEST_CASE( match_frame_round_trip )
 {
-  page_buffer   buf( TEST_PAGE_SIZE, TEST_PAGE_COUNT );
-  frame_encoder enc( buf.capacity() );
+  frame_encoder enc( TEST_BUDGET );
 
   const match_coords coords = sample_coords();
   const operation    op     = sample_transfer();
@@ -87,8 +88,8 @@ BOOST_AUTO_TEST_CASE( match_frame_round_trip )
   enc.encode_match( coords, ids, 3, op );
   BOOST_CHECK_EQUAL( enc.size(), match_frame_overhead( 3 ) + fc::raw::pack_size( op ) );
 
-  const std::byte* page;
-  frame_view f = round_trip( buf, enc, page );
+  std::vector< std::byte > buf;
+  frame_view f = round_trip( buf, enc );
   BOOST_CHECK( f.kind() == frame_kind::match );
   BOOST_CHECK( !f.body_omitted() );
   BOOST_CHECK_EQUAL( f.header.rule_count, 3u );
@@ -111,13 +112,12 @@ BOOST_AUTO_TEST_CASE( match_frame_round_trip )
 
 BOOST_AUTO_TEST_CASE( match_frame_without_rules )
 {
-  page_buffer   buf( TEST_PAGE_SIZE, TEST_PAGE_COUNT );
-  frame_encoder enc( buf.capacity() );
+  frame_encoder enc( TEST_BUDGET );
   const operation op = sample_transfer();
   enc.encode_match( sample_coords(), nullptr, 0, op );
 
-  const std::byte* page;
-  match_frame m = decode_match( round_trip( buf, enc, page ) );
+  std::vector< std::byte > buf;
+  match_frame m = decode_match( round_trip( buf, enc ) );
   BOOST_CHECK_EQUAL( m.rule_count, 0u );
   BOOST_CHECK( same_op( m.unpack_op(), op ) );
 }
@@ -134,9 +134,8 @@ BOOST_AUTO_TEST_CASE( body_omitted_when_op_exceeds_budget )
   enc.encode_match( sample_coords(), &id, 1, small );
   BOOST_CHECK_EQUAL( enc.size(), budget );
   {
-    page_buffer buf( TEST_PAGE_SIZE, TEST_PAGE_COUNT );
-    const std::byte* page;
-    match_frame m = decode_match( round_trip( buf, enc, page ) );
+    std::vector< std::byte > buf;
+    match_frame m = decode_match( round_trip( buf, enc ) );
     BOOST_CHECK( !m.body_omitted );
     BOOST_CHECK( same_op( m.unpack_op(), small ) );
   }
@@ -145,9 +144,8 @@ BOOST_AUTO_TEST_CASE( body_omitted_when_op_exceeds_budget )
   enc.encode_match( sample_coords(), &id, 1, large );
   BOOST_CHECK_EQUAL( enc.size(), match_frame_overhead( 1 ) );
   {
-    page_buffer buf( TEST_PAGE_SIZE, TEST_PAGE_COUNT );
-    const std::byte* page;
-    frame_view f = round_trip( buf, enc, page );
+    std::vector< std::byte > buf;
+    frame_view f = round_trip( buf, enc );
     BOOST_CHECK( f.body_omitted() );
     match_frame m = decode_match( f );
     BOOST_CHECK( m.body_omitted );
@@ -175,23 +173,19 @@ BOOST_AUTO_TEST_CASE( encoder_rejects_impossible_frames )
 
 BOOST_AUTO_TEST_CASE( lifecycle_frames_round_trip )
 {
-  page_buffer   buf( TEST_PAGE_SIZE, TEST_PAGE_COUNT );
-  frame_encoder enc( buf.capacity() );
+  frame_encoder enc( TEST_BUDGET );
   const block_id_type block_id = fc::ripemd160::hash( std::string( "block" ) );
 
+  std::vector< std::byte > buf;
   enc.encode_block_applied( 1000, block_id );
-  buf.append( enc.data(), enc.size() );
+  append( buf, enc );
   enc.encode_irreversible( 980 );
-  buf.append( enc.data(), enc.size() );
+  append( buf, enc );
   enc.encode_switch_fork( 995 );
-  buf.append( enc.data(), enc.size() );
-  buf.rotate();
+  append( buf, enc );
+  BOOST_CHECK_EQUAL( buf.size(), 3 * sizeof( frame_header ) + 24 + 4 + 4 );
 
-  const std::byte* page = buf.take( nullptr );
-  BOOST_REQUIRE( page != nullptr );
-  page_reader reader( page, TEST_PAGE_SIZE );
-  BOOST_CHECK_EQUAL( reader.header().used, 3 * sizeof( frame_header ) + 24 + 4 + 4 );
-
+  frame_reader reader( buf.data(), buf.size() );
   frame_view f = reader.next();
   BOOST_CHECK( f.kind() == frame_kind::block_applied );
   uint32_t      num;
@@ -215,45 +209,36 @@ BOOST_AUTO_TEST_CASE( lifecycle_frames_round_trip )
   BOOST_CHECK_THROW( reader.next(), fc::exception );
 }
 
-BOOST_AUTO_TEST_CASE( reader_rejects_frame_running_past_page )
+BOOST_AUTO_TEST_CASE( reader_rejects_frame_running_past_buffer )
 {
-  // a page whose only frame claims more payload than the page holds
-  std::vector< std::byte > page( TEST_PAGE_SIZE );
-  page_header  ph{ 0, sizeof( frame_header ) + 4, 0 };
-  frame_header fh{ 100, uint8_t( frame_kind::irreversible ), 0, 0 };
-  std::memcpy( page.data(), &ph, sizeof( ph ) );
-  std::memcpy( page.data() + sizeof( ph ), &fh, sizeof( fh ) );
+  // a buffer whose only frame claims more payload than the buffer holds
+  std::vector< std::byte > buf( sizeof( frame_header ) + 4 );
+  frame_header fh{ 100, uint8_t( frame_kind::match ), 0, 0 };
+  std::memcpy( buf.data(), &fh, sizeof( fh ) );
 
-  page_reader reader( page.data(), TEST_PAGE_SIZE );
+  frame_reader reader( buf.data(), buf.size() );
   BOOST_CHECK( reader.more() );
   BOOST_CHECK_THROW( reader.next(), fc::exception );
 
   // a header that itself does not fit
-  ph.used = 3;
-  std::memcpy( page.data(), &ph, sizeof( ph ) );
-  page_reader truncated( page.data(), TEST_PAGE_SIZE );
+  frame_reader truncated( buf.data(), 3 );
+  BOOST_CHECK( truncated.more() );
   BOOST_CHECK_THROW( truncated.next(), fc::exception );
 
-  // a page header claiming more used bytes than the page holds is rejected
-  // before anything past the page is touched
-  ph.used = TEST_PAGE_SIZE - sizeof( page_header ) + 1;
-  std::memcpy( page.data(), &ph, sizeof( ph ) );
-  BOOST_CHECK_THROW( page_reader( page.data(), TEST_PAGE_SIZE ), fc::exception );
-  ph.used = TEST_PAGE_SIZE - sizeof( page_header );
-  std::memcpy( page.data(), &ph, sizeof( ph ) );
-  BOOST_CHECK_NO_THROW( page_reader( page.data(), TEST_PAGE_SIZE ) );
+  // an empty buffer has no frames and says so
+  frame_reader empty( buf.data(), 0 );
+  BOOST_CHECK( !empty.more() );
+  BOOST_CHECK_THROW( empty.next(), fc::exception );
 }
 
 BOOST_AUTO_TEST_CASE( decoder_rejects_short_match_payload )
 {
-  std::vector< std::byte > page( TEST_PAGE_SIZE );
   // a match frame claiming two rule ids but carrying only the coordinates
-  page_header  ph{ 0, sizeof( frame_header ) + match_coords_size, 0 };
+  std::vector< std::byte > buf( sizeof( frame_header ) + match_coords_size );
   frame_header fh{ match_coords_size, uint8_t( frame_kind::match ), 0, 2 };
-  std::memcpy( page.data(), &ph, sizeof( ph ) );
-  std::memcpy( page.data() + sizeof( ph ), &fh, sizeof( fh ) );
+  std::memcpy( buf.data(), &fh, sizeof( fh ) );
 
-  page_reader reader( page.data(), TEST_PAGE_SIZE );
+  frame_reader reader( buf.data(), buf.size() );
   frame_view f = reader.next();
   BOOST_CHECK_THROW( decode_match( f ), fc::exception );
 }

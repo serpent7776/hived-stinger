@@ -1,7 +1,5 @@
 #pragma once
 
-#include <hive/plugins/stinger/page_buffer.hpp>
-
 #include <hive/protocol/operations.hpp>
 #include <hive/protocol/types.hpp>
 
@@ -81,9 +79,9 @@ namespace hive { namespace plugins { namespace stinger {
 using bounded_stream = fc::datastream< bounded_window >;
 
 /**
- * The match stream's frame format: what the writer thread appends to the
- * page buffer and the sink thread decodes. Byte-oriented with no alignment
- * requirement (headers are memcpy'd into stack structs on both sides),
+ * The match stream's frame format: what the writer thread appends to a
+ * block's match buffer and the sink thread decodes. Byte-oriented with no
+ * alignment requirement (headers are memcpy'd into stack structs on both sides),
  * native endian, in-process only - it is not an on-the-wire format, so it
  * carries no version until a sink writes it to a file or a socket.
  *
@@ -132,9 +130,9 @@ struct frame_header
   uint16_t rule_count;
 
   /// the packed operation body was too large for the frame budget and was left out.
-  /// Not expected in practice: an operation is bounded by the voted block size
-  /// (64 KiB on mainnet, 2 MiB protocol ceiling), the page is 1 MiB. Safety
-  /// valve for a block size vote above the page, not a path real traffic takes.
+  /// Not expected in practice: an operation in a block is bounded by the block
+  /// size ceiling and the budget is above it. Safety valve, not a path real
+  /// traffic takes.
   static constexpr uint8_t FLAG_BODY_OMITTED = 1;
 };
 static_assert( sizeof( frame_header ) == 8, "frame header must be 8 bytes" );
@@ -155,7 +153,7 @@ struct match_coords
 constexpr size_t match_coords_size = 4 + 4 + 4 + 4 + 1 + 20;
 static_assert( sizeof( protocol::transaction_id_type ) == 20, "transaction id must be 20 bytes" );
 
-/// bytes a match frame takes in a page before the packed operation body
+/// bytes a match frame takes before the packed operation body
 constexpr size_t match_frame_overhead( size_t rule_count )
 {
   return sizeof( frame_header ) + match_coords_size + 8 * rule_count;
@@ -163,11 +161,11 @@ constexpr size_t match_frame_overhead( size_t rule_count )
 
 /**
  * Builds frames in a scratch buffer owned by the writer thread, one at a
- * time, for page_buffer::append. Allocates once at construction (the
- * scratch is the frame budget: page capacity) and never again.
+ * time, for the caller to copy into a block's match buffer. Allocates once
+ * at construction (the scratch is the frame budget) and never again.
  *
  * The budget is the bound the packed operation is checked against, minus
- * the frame's own overhead, so every frame built here fits a page by
+ * the frame's own overhead, so every frame built here fits the budget by
  * construction; an operation that does not fit is replaced by the
  * body_omitted flag rather than failing the frame. Packing goes through a
  * bounded stream in one pass - no pack_size pre-pass, so an operation is
@@ -177,7 +175,7 @@ class frame_encoder
 {
 public:
 
-  /// `budget` is the largest frame the encoder may build; page_buffer::capacity()
+  /// `budget` is the largest frame the encoder may build
   explicit frame_encoder( size_t budget )
     : _scratch( budget )
   {
@@ -280,7 +278,7 @@ private:
 };
 
 /// One frame as the sink sees it: the header and a view of the payload,
-/// which lives in the page until the page is handed back.
+/// which lives in the block's match buffer for as long as the sink holds it.
 struct frame_view
 {
   frame_header     header;
@@ -291,55 +289,41 @@ struct frame_view
 };
 
 /**
- * Walks the frames of a page handed out by page_buffer::take(). The page
- * header's `used` is checked against the page size (page_buffer::page_size())
- * and every step checks that the frame stays within `used`; a violation
- * throws fc::exception - an encoder-bug tripwire, not a race check: a taken
- * page is the consumer's alone.
+ * Walks the frames packed back to back in `len` bytes at `data`: one
+ * block's match buffer as the writer sealed it. Every step checks that the
+ * frame stays within the buffer; a violation throws fc::exception - an
+ * encoder-bug tripwire, not a race check: a released block is the sink's alone.
  */
-class page_reader
+class frame_reader
 {
 public:
-  page_reader( const std::byte* page, size_t page_size )
-  {
-    FC_ASSERT( page_size >= sizeof( page_header ), "page of ${s} bytes cannot hold a page header", ("s", page_size) );
-    std::memcpy( &_header, page, sizeof( _header ) );
-    FC_ASSERT( _header.used <= page_size - sizeof( page_header ),
-               "page ${p} claims ${u} used bytes in a page of ${s}",
-               ("p", _header.page_index)("u", _header.used)("s", page_size) );
-    _cur = page + sizeof( page_header );
-    _end = _cur + _header.used;
-  }
+  frame_reader( const std::byte* data, size_t len ) : _cur( data ), _end( data + len ) {}
 
-  /// the page's header, as stamped by page_buffer::rotate()
-  const page_header& header() const { return _header; }
   /// true while frames remain
   bool more() const { return _cur < _end; }
 
   /// the next frame; call only while more()
   frame_view next()
   {
-    FC_ASSERT( more(), "no frames left in page ${p}", ("p", _header.page_index) );
-    FC_ASSERT( size_t( _end - _cur ) >= sizeof( frame_header ),
-               "frame header runs past the end of page ${p}", ("p", _header.page_index) );
+    FC_ASSERT( more(), "no frames left" );
+    FC_ASSERT( size_t( _end - _cur ) >= sizeof( frame_header ), "frame header runs past the end of the buffer" );
     frame_view f;
     std::memcpy( &f.header, _cur, sizeof( f.header ) );
     _cur += sizeof( f.header );
     FC_ASSERT( size_t( _end - _cur ) >= f.header.len,
-               "frame of ${n} bytes runs past the end of page ${p}", ("n", f.header.len)("p", _header.page_index) );
+               "frame of ${n} bytes runs past the end of the buffer", ("n", f.header.len) );
     f.payload = _cur;
     _cur += f.header.len;
     return f;
   }
 
 private:
-  page_header      _header;
   const std::byte* _cur;
   const std::byte* _end;
 };
 
 /// A decoded match frame: coordinates, rule ids, and a view of the packed
-/// operation body (empty when body_omitted). The views point into the page.
+/// operation body (empty when body_omitted). The views point into the block's buffer.
 struct match_frame
 {
   match_coords     coords;
