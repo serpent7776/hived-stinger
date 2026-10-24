@@ -91,6 +91,7 @@ add_boost_test( plugin_test
     stinger_rules
     stinger_frame
     stinger_streams
+    stinger_records
 )
 
 # needed to correctly print crash stacktrace
