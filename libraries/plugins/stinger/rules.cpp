@@ -34,7 +34,7 @@ void check_rule_object( const fc::variant& var, size_t index )
   const std::string what = "rule #" + std::to_string( index );
   FC_ASSERT( var.is_object(), "${w} is not a JSON object", ("w", what) );
   const auto& rule = var.get_object();
-  reject_unknown_keys( rule, { "name", "match", "enrich", "exec" }, what );
+  reject_unknown_keys( rule, { "name", "match", "enrich", "exec", "delivery" }, what );
   require_key( rule, "name", what );
   require_key( rule, "match", what );
   require_key( rule, "exec", what );
@@ -42,6 +42,14 @@ void check_rule_object( const fc::variant& var, size_t index )
   reject_unknown_keys( rule[ "exec" ].get_object(), { "type" }, "exec of " + what );
   if( rule.contains( "enrich" ) )
     FC_ASSERT( rule[ "enrich" ].is_array(), "enrich of ${w} is not a JSON array", ("w", what) );
+  if( rule.contains( "delivery" ) )
+  {
+    // checked by hand for the message: fc's enum conversion reports a bad cast
+    FC_ASSERT( rule[ "delivery" ].is_string(), "delivery of ${w} is not a string", ("w", what) );
+    const std::string& d = rule[ "delivery" ].get_string();
+    FC_ASSERT( d == "irreversible" || d == "head",
+      "unknown delivery \"${d}\" in ${w} (known: irreversible, head)", ("d", d)("w", what) );
+  }
 }
 
 void check_exec( const exec_definition& exec, const std::string& what )

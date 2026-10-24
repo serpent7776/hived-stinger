@@ -131,5 +131,28 @@ BOOST_AUTO_TEST_CASE( malformed_execs )
                        "exec": { "type": "log", "level": "info" } } ] } )" ), fc::exception );
 }
 
+BOOST_AUTO_TEST_CASE( delivery_class )
+{
+  using hive::plugins::stinger::delivery_class;
+  fc::temp_directory dir;
+  rules_config config = load_from_text( dir, R"(
+    { "rules": [
+      { "name": "safe", "match": "op_type = 2", "exec": { "type": "log" } },
+      { "name": "fast", "match": "op_type = 2", "exec": { "type": "log" }, "delivery": "head" },
+      { "name": "explicit", "match": "op_type = 2", "exec": { "type": "log" }, "delivery": "irreversible" } ] } )" );
+  BOOST_REQUIRE_EQUAL( config.rules.size(), 3u );
+  // irreversible unless asked otherwise
+  BOOST_CHECK( config.rules[0].delivery == delivery_class::irreversible );
+  BOOST_CHECK( config.rules[1].delivery == delivery_class::head );
+  BOOST_CHECK( config.rules[2].delivery == delivery_class::irreversible );
+
+  // unknown class
+  BOOST_REQUIRE_THROW( load_from_text( dir,
+    R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": "log" }, "delivery": "soon" } ] } )" ), fc::exception );
+  // the enumerator's number is not accepted, only its name
+  BOOST_REQUIRE_THROW( load_from_text( dir,
+    R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": "log" }, "delivery": 1 } ] } )" ), fc::exception );
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 #endif

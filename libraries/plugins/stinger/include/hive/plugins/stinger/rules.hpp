@@ -25,6 +25,25 @@ struct exec_definition
 };
 
 /**
+ * When a rule's matches leave the node.
+ *   irreversible - once the block is irreversible: the consumer never sees a
+ *                  match that can be undone, about one block after it was
+ *                  applied with one-block irreversibility. The default.
+ *   head         - as the operation is applied, while its block can still be
+ *                  popped by a fork or rolled back on failure. The stream then
+ *                  also carries the lifecycle frames the consumer needs to
+ *                  retract: block_applied and switch_fork (frame.hpp).
+ * The two classes are independent streams; a block's head matches arrive
+ * before its irreversible ones, and in a fork the head stream retracts a
+ * block the irreversible stream never mentions.
+ */
+enum class delivery_class : uint8_t
+{
+  irreversible = 0,
+  head         = 1
+};
+
+/**
  * One entry of the stinger-rules-file. `match` is a be-tree boolean
  * expression over the attribute vocabulary declared at startup (see
  * declare_rule_attributes in stinger_plugin.cpp); it is compiled when the
@@ -41,6 +60,7 @@ struct rule_definition
   /// not implemented yet - load_rules_file rejects rules that use it
   std::vector< fc::variant >  enrich;
   exec_definition             exec;
+  delivery_class              delivery = delivery_class::irreversible;
 
   /// be-tree subscription id, derived by load_rules_file as city_hash64 of
   /// `name` - not part of the file format (a cross-name hash collision is
@@ -57,7 +77,10 @@ struct rules_config
  * Parse and validate a stinger rules file:
  *
  *   { "rules": [ { "name": "...", "match": "...",
- *                  "exec": { "type": "log" } }, ... ] }
+ *                  "exec": { "type": "log" },
+ *                  "delivery": "irreversible" | "head" }, ... ] }
+ *
+ * `delivery` is optional and defaults to irreversible.
  *
  * Validation is strict - unknown keys, missing required keys, duplicate
  * names or a malformed exec throw fc::exception with the offending rule
@@ -69,6 +92,7 @@ rules_config load_rules_file( const fc::path& path );
 
 } } } // hive::plugins::stinger
 
+FC_REFLECT_ENUM( hive::plugins::stinger::delivery_class, (irreversible)(head) )
 FC_REFLECT( hive::plugins::stinger::exec_definition, (type) )
-FC_REFLECT( hive::plugins::stinger::rule_definition, (name)(match)(enrich)(exec) )
+FC_REFLECT( hive::plugins::stinger::rule_definition, (name)(match)(enrich)(exec)(delivery) )
 FC_REFLECT( hive::plugins::stinger::rules_config, (rules) )
