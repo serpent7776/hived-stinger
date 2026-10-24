@@ -124,10 +124,12 @@ struct event_attribute_visitor
  * mid-application; its leading transactions had already matched) and on
  * switch_fork (everything above the new head), and released to the sink at
  * irreversible_block. With one-block irreversibility the window is normally
- * one block deep. All of that state is touched on the writer thread only;
- * the one cross-thread point is the release, a mutex-guarded queue the sink
- * waits on. The writer never blocks on the sink: a full queue drops the
- * oldest block, counted and warned about.
+ * one block deep. All of that state is touched under _writer_mutex only:
+ * by the writer thread, and by the main thread for the irreversible and
+ * fork signals the chain fires during startup and replay, when it is empty.
+ * The one cross-thread point to the sink is the release, a mutex-guarded
+ * queue it waits on. The writer never blocks on the sink: a full queue
+ * drops the oldest block, counted and warned about.
  *
  * Matches held at shutdown - blocks applied but not yet irreversible - are
  * dropped and their block numbers logged: a restart replays those blocks
@@ -200,18 +202,18 @@ public:
   /// the sink thread; a plain std::thread, not scheduled against appbase
   std::thread                      _sink;
 
-  /// Handshake between the signal handlers on the writer thread and
-  /// stop_sink() on the shutdown thread. signals2's disconnect() stops new
-  /// invocations but does not wait for one already running, and a handler
-  /// may be mid-way through _pending when stop_sink() wants to report it.
-  /// Each handler enters by incrementing _in_handler and then checking
-  /// _stopping (bailing if set); stop_sink() sets _stopping and then spins
-  /// until _in_handler is 0. Both seq_cst, so the two sides cannot both miss
-  /// each other: either the handler bails before touching producer state, or
-  /// the spin waits for its release-decrement, which is the happens-before
-  /// edge that lets the shutdown thread read the writer-private state.
-  std::atomic< bool >     _stopping{ false };
-  std::atomic< unsigned > _in_handler{ 0 };
+  /// Serializes the signal handlers against stop_sink() on the shutdown
+  /// thread. signals2's disconnect() stops new invocations but does not
+  /// wait for one already running, and a handler may be mid-way through
+  /// _pending when stop_sink() wants to report it. A handler holds the lock
+  /// for its whole body; stop_sink() takes it to set _stopping, which waits
+  /// out a running handler, and every handler entered afterwards returns at
+  /// once. Uncontended on every call but that one, so it costs nothing next
+  /// to the be-tree search, and it also covers the irreversible and fork
+  /// signals the chain fires from the main thread during startup.
+  std::mutex _writer_mutex;
+  /// under _writer_mutex
+  bool       _stopping = false;
   /// set by the sink thread if it exits on an exception: handlers stop
   /// producing for a sink that will never drain, and stop_sink() reports it
   std::atomic< bool >     _sink_failed{ false };
@@ -229,38 +231,33 @@ public:
 };
 
 /**
- * RAII side of the shutdown handshake: every handler starts with one of
- * these and returns at once when it reports inactive. A scope guard rather
- * than manual stores because handlers throw by design (the FC_ASSERTs
- * around the be-tree calls and the frame encoder) and a decrement
- * skipped by stack unwinding would hang stop_sink() forever.
+ * Every handler starts with one of these and returns at once when it
+ * reports inactive: it holds _writer_mutex for the handler's body and
+ * checks the two reasons not to run - stop_sink() has begun, or the sink
+ * thread has died. A scope object because handlers throw by design (the
+ * FC_ASSERTs around the be-tree calls and the frame encoder) and the lock
+ * must go with the stack.
  */
 class handler_scope
 {
 public:
-  explicit handler_scope( stinger_plugin_impl& impl ) : _impl( impl )
+  explicit handler_scope( stinger_plugin_impl& impl )
+    : _lock( impl._writer_mutex ),
+      _active( !impl._stopping && !impl._sink_failed.load( std::memory_order_relaxed ) )
   {
-    _impl._in_handler.fetch_add( 1, std::memory_order_seq_cst );
-    _active = !_impl._stopping.load( std::memory_order_seq_cst )
-           && !_impl._sink_failed.load( std::memory_order_relaxed );
     if( !_active )
-      _impl._in_handler.fetch_sub( 1, std::memory_order_release );
-  }
-  ~handler_scope()
-  {
-    if( _active )
-      _impl._in_handler.fetch_sub( 1, std::memory_order_release );
+      _lock.unlock();
   }
   handler_scope( const handler_scope& ) = delete;
   handler_scope& operator=( const handler_scope& ) = delete;
 
   /// false once stop_sink() has begun, or the sink thread has died: the
-  /// handler must not touch producer state (or has nobody to produce for)
+  /// handler must not touch writer state (or has nobody to produce for)
   explicit operator bool() const { return _active; }
 
 private:
-  stinger_plugin_impl& _impl;
-  bool                 _active;
+  std::unique_lock< std::mutex > _lock;
+  bool                           _active;
 };
 
 void stinger_plugin_impl::on_post_apply_operation( const operation_notification& note )
@@ -569,21 +566,19 @@ void stinger_plugin_impl::stop_sink()
   if( !_sink.joinable() )
     return;  // never started, or already stopped
 
-  // 1. no handler entered from here on touches producer state
-  _stopping.store( true, std::memory_order_seq_cst );
+  // 1. no handler from here on touches writer state: taking the lock waits
+  // out one already running, and every later one sees _stopping and returns
+  {
+    std::lock_guard< std::mutex > lock( _writer_mutex );
+    _stopping = true;
+  }
   // 2. no new handler invocations
   hive::utilities::disconnect_signal( post_apply_operation_connection );
   hive::utilities::disconnect_signal( post_apply_block_connection );
   hive::utilities::disconnect_signal( fail_apply_block_connection );
   hive::utilities::disconnect_signal( irreversible_block_connection );
   hive::utilities::disconnect_signal( switch_fork_connection );
-  // 3. wait out the invocations already dispatched - a finite set after 2.
-  // seq_cst, not acquire: the store-buffering argument needs all four
-  // operations in the one total order, or this load may still see 0 after
-  // a handler's increment that preceded its own _stopping check
-  while( _in_handler.load( std::memory_order_seq_cst ) != 0 )
-    std::this_thread::yield();
-  // 4. this thread owns the writer-private state now. What is not
+  // 3. this thread owns the writer-private state now. What is not
   // irreversible is not delivered; say what that was
   const uint32_t held_frames = _current.frames;
   if( !_pending.empty() || held_frames != 0 )
@@ -598,14 +593,14 @@ void stinger_plugin_impl::stop_sink()
     _pending.clear();
     _current = block_matches{};
   }
-  // 5. the stream has ended; set after the final release, under the same
+  // 4. the stream has ended; set after the final release, under the same
   // mutex, so the sink's "stopped and empty" means drained
   {
     std::lock_guard< std::mutex > lock( _ready_mutex );
     _ready_stopped = true;
   }
   _ready_cv.notify_one();
-  // 6. the sink exits once it has drained the queue
+  // 5. the sink exits once it has drained the queue
   _sink.join();
 
   if( _sink_failed.load( std::memory_order_relaxed ) )
