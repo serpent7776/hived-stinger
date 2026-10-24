@@ -4,6 +4,7 @@ add_library( stinger_plugin
              stinger_plugin.cpp
              rules.cpp
              records.cpp
+             socket_sink.cpp
              ${HEADERS}
            )
 
