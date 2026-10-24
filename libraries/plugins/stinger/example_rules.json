@@ -3,7 +3,7 @@
     {
       "name": "large-hive-transfer",
       "match": "op_type = 2 and symbol = \"HIVE\" and amount > 1000000",
-      "exec": { "type": "log" }
+      "exec": { "type": "socket" }
     },
     {
       "name": "alice-activity",

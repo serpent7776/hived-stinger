@@ -10,6 +10,7 @@
 #include <fstream>
 #include <string>
 
+using hive::plugins::stinger::exec_type;
 using hive::plugins::stinger::load_rules_file;
 using hive::plugins::stinger::rules_config;
 
@@ -48,9 +49,9 @@ BOOST_AUTO_TEST_CASE( valid_rules_file )
   BOOST_CHECK_EQUAL( config.rules[0].id, fc::city_hash64( name.data(), name.size() ) );
   BOOST_CHECK_EQUAL( config.rules[0].name, name );
   BOOST_CHECK_EQUAL( config.rules[0].match, "op_type = 2 and amount > 1000000" );
-  BOOST_CHECK_EQUAL( config.rules[0].exec.type, "log" );
+  BOOST_CHECK( config.rules[0].exec.type == exec_type::log );
   BOOST_CHECK_EQUAL( config.rules[1].name, "sl-market" );
-  BOOST_CHECK_EQUAL( config.rules[1].exec.type, "log" );
+  BOOST_CHECK( config.rules[1].exec.type == exec_type::log );
 }
 
 BOOST_AUTO_TEST_CASE( empty_rules_list_is_valid )
@@ -119,12 +120,30 @@ BOOST_AUTO_TEST_CASE( explicit_id_is_rejected )
     R"( { "rules": [ { "id": 1, "name": "r", "match": "op_type = 2", "exec": { "type": "log" } } ] } )" ), fc::exception );
 }
 
+BOOST_AUTO_TEST_CASE( exec_types )
+{
+  fc::temp_directory dir;
+  rules_config config = load_from_text( dir, R"(
+    { "rules": [
+      { "name": "quiet", "match": "op_type = 2", "exec": { "type": "log" } },
+      { "name": "wired", "match": "op_type = 2", "exec": { "type": "socket" } } ] } )" );
+  BOOST_REQUIRE_EQUAL( config.rules.size(), 2u );
+  BOOST_CHECK( config.rules[0].exec.type == exec_type::log );
+  BOOST_CHECK( config.rules[1].exec.type == exec_type::socket );
+}
+
 BOOST_AUTO_TEST_CASE( malformed_execs )
 {
   fc::temp_directory dir;
   // unknown exec type
   BOOST_REQUIRE_THROW( load_from_text( dir,
     R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": "carrier-pigeon" } } ] } )" ), fc::exception );
+  // the enumerator's number is not accepted, only its name
+  BOOST_REQUIRE_THROW( load_from_text( dir,
+    R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { "type": 1 } } ] } )" ), fc::exception );
+  // no type at all
+  BOOST_REQUIRE_THROW( load_from_text( dir,
+    R"( { "rules": [ { "name": "r", "match": "op_type = 2", "exec": { } } ] } )" ), fc::exception );
   // unknown exec key
   BOOST_REQUIRE_THROW( load_from_text( dir,
     R"( { "rules": [ { "name": "r", "match": "op_type = 2",

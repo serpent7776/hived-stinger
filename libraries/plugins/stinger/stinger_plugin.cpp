@@ -1,7 +1,9 @@
 #include <hive/chain/hive_fwd.hpp>
 
 #include <hive/plugins/stinger/frame.hpp>
+#include <hive/plugins/stinger/records.hpp>
 #include <hive/plugins/stinger/rules.hpp>
+#include <hive/plugins/stinger/socket_sink.hpp>
 #include <hive/plugins/stinger/stinger_plugin.hpp>
 #include <hive/plugins/stinger/streams.hpp>
 
@@ -32,11 +34,13 @@ extern "C" {
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
+#define STINGER_SOCKET_KEY     "stinger-socket"
 
 namespace hive { namespace plugins { namespace stinger {
 
@@ -70,6 +74,18 @@ constexpr size_t STINGER_READY_BATCHES_MAX = 1024;
 
 /// drops are reported at most this often
 constexpr std::chrono::seconds DROP_LOG_INTERVAL{ 10 };
+
+/// The longest line the socket carries, newline included; a match whose
+/// line would be longer goes out without its operation body. Well under
+/// the send buffer, so a line always fits a consumer that is keeping up,
+/// and well over any operation the chain carries today: the transaction
+/// limit is 64 KB, and only a hostile body (control characters render six
+/// bytes each) gets anywhere near this.
+constexpr size_t STINGER_SOCKET_LINE_MAX = 1024 * 1024;
+
+/// how long the sink waits for a batch before it looks at the socket for
+/// consumers connecting or leaving; only when there is a socket
+constexpr std::chrono::milliseconds SINK_POLL_INTERVAL{ 500 };
 
 
 /// be-tree event variable ids as returned by betree_add_*_variable, used as betree_set_variable slots
@@ -141,6 +157,14 @@ struct event_attribute_visitor
  * An operation matched by rules of both classes puts the same frame, with
  * every matched rule id, in both batches; the sink reports to each stream
  * only the rules of that class.
+ *
+ * The sink thread decodes a batch and hands each match to the rules' exec
+ * targets (rules.hpp): a log line per rule for `log`, and for `socket` one
+ * JSON line per class on the unix socket (records.hpp, socket_sink.hpp),
+ * naming every socket rule of that class that matched. The head stream's
+ * markers go to the socket as well, when there is one. The socket is
+ * served by the sink thread between batches, so it never touches the
+ * writer either.
  *
  * All writer state is touched under _writer_mutex only: by the writer
  * thread, and by the main thread for the irreversible and fork signals the
@@ -249,6 +273,14 @@ public:
   uint64_t _batches_delivered          = 0;
   uint32_t _last_irreversible_delivered = 0;
   uint32_t _last_head_delivered         = 0;
+
+  /// sink-private: the socket, when stinger-socket is set; created in
+  /// plugin_initialize before the sink thread starts and destroyed by
+  /// stop_sink() after it is joined
+  std::unique_ptr< socket_sink >   _socket;
+  record_writer                    _records{ STINGER_SOCKET_LINE_MAX };
+  /// the socket rules of one class that matched a frame; scratch
+  std::vector< std::string_view >  _socket_rules;
 
   chain::database::signal_connection_ptr post_apply_operation_connection;
   chain::database::signal_connection_ptr post_apply_block_connection;
@@ -536,17 +568,33 @@ void stinger_plugin_impl::sink_loop()
     // a foreign thread on first use, and set_name is direct on the current thread
     fc::thread::current().set_name( "stinger_sink" );
 
+    const auto ready = [this]() { return !_ready.empty() || _ready_stopped; };
     for( ;; )
     {
       block_matches b;
+      bool          have = false;
       {
         std::unique_lock< std::mutex > lock( _ready_mutex );
-        _ready_cv.wait( lock, [this]() { return !_ready.empty() || _ready_stopped; } );
-        if( _ready.empty() )
-          break;  // stopped, and stop is set after the final release: drained
-        b = std::move( _ready.front() );
-        _ready.pop_front();
+        // with a socket the wait is bounded, so consumers are accepted and
+        // reaped while no batch arrives
+        if( _socket )
+          _ready_cv.wait_for( lock, SINK_POLL_INTERVAL, ready );
+        else
+          _ready_cv.wait( lock, ready );
+        if( !_ready.empty() )
+        {
+          b = std::move( _ready.front() );
+          _ready.pop_front();
+          have = true;
+        }
+        else if( _ready_stopped )
+          break;  // stop is set after the final release: drained
       }
+      // before the batch, so a consumer that just connected gets it
+      if( _socket )
+        _socket->poll( _records.hello() );
+      if( !have )
+        continue;
       // a decode tripwire or a sink bug drops this block, not hived: an
       // exception escaping a std::thread is std::terminate
       try
@@ -616,12 +664,17 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
           "stinger: head block ${b} delivered after block ${l}", ("b", block_num)("l", _last_head_delivered) );
         _last_head_delivered = block_num;
         dlog( "stinger: head block ${b} ${id} applied", ("b", block_num)("id", block_id) );
+        if( _socket )
+          _socket->send( _records.block_applied( block_num, block_id ) );
         break;
       }
       case frame_kind::irreversible:
       {
         FC_ASSERT( b.cls == delivery_class::head, "stinger: irreversible frame in the irreversible stream" );
-        dlog( "stinger: head blocks up to ${b} irreversible", ("b", decode_block_num( f )) );
+        const uint32_t block_num = decode_block_num( f );
+        dlog( "stinger: head blocks up to ${b} irreversible", ("b", block_num) );
+        if( _socket )
+          _socket->send( _records.irreversible( block_num ) );
         break;
       }
       case frame_kind::switch_fork:
@@ -630,6 +683,8 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
         const uint32_t new_head = decode_block_num( f );
         ilog( "stinger: head blocks above ${b} retracted by a fork switch", ("b", new_head) );
         _last_head_delivered = new_head;
+        if( _socket )
+          _socket->send( _records.switch_fork( new_head ) );
         break;
       }
       default:
@@ -643,9 +698,10 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
 
 void stinger_plugin_impl::deliver_match( const match_frame& m, delivery_class cls )
 {
-  // the only sink for now is the log, one line per matched rule of the class
+  // log rules get a line each; socket rules are collected into one record
   fc::variant op_body;
   bool        unpacked = false;
+  _socket_rules.clear();
 
   for( size_t i = 0; i < m.rule_count; ++i )
   {
@@ -659,19 +715,31 @@ void stinger_plugin_impl::deliver_match( const match_frame& m, delivery_class cl
     }
     if( rule->second->delivery != cls )
       continue;   // the other stream's rule
-    if( !unpacked )
+    switch( rule->second->exec.type )
     {
-      // the body is unpacked once per frame, and only for a stream that reports it
-      if( m.body_omitted )
-        op_body = "<omitted: operation exceeds the frame budget>";
-      else
-        fc::to_variant( m.unpack_op(), op_body );
-      unpacked = true;
+      case exec_type::socket:
+        _socket_rules.push_back( rule->second->name );
+        break;
+      case exec_type::log:
+        if( !unpacked )
+        {
+          // the body is unpacked once per frame, and only when a log rule wants it
+          if( m.body_omitted )
+            op_body = "<omitted: operation exceeds the frame budget>";
+          else
+            fc::to_variant( m.unpack_op(), op_body );
+          unpacked = true;
+        }
+        ilog( "stinger: match rule=${r} delivery=${d} block=${b} trx_id=${t} trx_in_block=${tib} op_in_trx=${oit} virtual_op=${v} op=${op}",
+          ("r", rule->second->name)("d", cls)("b", m.coords.block_num)("t", m.coords.trx_id)
+          ("tib", m.coords.trx_in_block)("oit", m.coords.op_in_trx)("v", m.coords.virtual_op)("op", op_body) );
+        break;
     }
-    ilog( "stinger: match rule=${r} delivery=${d} block=${b} trx_id=${t} trx_in_block=${tib} op_in_trx=${oit} virtual_op=${v} op=${op}",
-      ("r", rule->second->name)("d", cls)("b", m.coords.block_num)("t", m.coords.trx_id)
-      ("tib", m.coords.trx_in_block)("oit", m.coords.op_in_trx)("v", m.coords.virtual_op)("op", op_body) );
   }
+
+  // rendered even with nobody connected: seq counts what the node emitted
+  if( !_socket_rules.empty() && _socket )
+    _socket->send( _records.match( cls, _socket_rules, m ) );
 }
 
 void stinger_plugin_impl::stop_sink()
@@ -718,6 +786,15 @@ void stinger_plugin_impl::stop_sink()
   else
     ilog( "stinger: sink stopped - ${r} batch(es) released, ${c} delivered, ${d} dropped, ${f} frame(s)",
       ("r", _batches_released)("c", _batches_delivered)("d", _batches_dropped)("f", _frames_released) );
+  // 6. the socket goes with the sink thread that served it; consumers see EOF
+  if( _socket )
+  {
+    const auto& s = _socket->stats();
+    ilog( "stinger: socket ${p} closed - ${a} connection(s) accepted, ${l} line(s) / ${b} byte(s) sent, ${r} record(s) rendered, ${c} closed by consumers, ${d} dropped behind, ${f} failed",
+      ("p", _socket->path().generic_string())("a", s.accepted)("l", s.lines)("b", s.bytes)("r", _records.next_seq() - 1)
+      ("c", s.closed_by_peer)("d", s.dropped_behind)("f", s.failed) );
+    _socket.reset();
+  }
 }
 
 /// registers the rule attributes and returns the event variable id betree assigned to each
@@ -748,6 +825,8 @@ void stinger_plugin::set_program_options( boost::program_options::options_descri
 {
   cfg.add_options()
     ( STINGER_RULES_FILE_KEY, boost::program_options::value<std::string>(), "Path to the file with stinger rule definitions." )
+    ( STINGER_SOCKET_KEY, boost::program_options::value<std::string>(),
+      "Path of the unix socket the stinger match stream is served on, as newline-delimited JSON. Required when a rule's exec type is socket." )
     ;
 }
 
@@ -782,6 +861,19 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     my->_head = head_stream( head_rules != 0 );
     ilog( "stinger: subscription index built, ${n} rule(s), ${h} delivered at head",
       ("n", my->rules.rules.size())("h", head_rules) );
+
+    // the socket, if asked for; a rule that needs one and finds none is a
+    // configuration error, found now and not at the first match
+    const size_t socket_rules = std::count_if( my->rules.rules.begin(), my->rules.rules.end(),
+      []( const rule_definition& r ) { return r.exec.type == exec_type::socket; } );
+    if( options.count( STINGER_SOCKET_KEY ) )
+    {
+      my->_socket = std::make_unique< socket_sink >( fc::path( options.at( STINGER_SOCKET_KEY ).as< std::string >() ) );
+      ilog( "stinger: serving ${n} rule(s) on socket ${p}", ("n", socket_rules)("p", my->_socket->path().generic_string()) );
+    }
+    else
+      FC_ASSERT( socket_rules == 0,
+        "stinger: ${n} rule(s) have exec type socket but " STINGER_SOCKET_KEY " is not set", ("n", socket_rules) );
 
     // the encoder and the sink thread must exist before the handlers
     // connect, for the same reason as the index; the sink reads

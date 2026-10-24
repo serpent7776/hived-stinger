@@ -39,7 +39,14 @@ void check_rule_object( const fc::variant& var, size_t index )
   require_key( rule, "match", what );
   require_key( rule, "exec", what );
   FC_ASSERT( rule[ "exec" ].is_object(), "exec of ${w} is not a JSON object", ("w", what) );
-  reject_unknown_keys( rule[ "exec" ].get_object(), { "type" }, "exec of " + what );
+  const auto& exec = rule[ "exec" ].get_object();
+  reject_unknown_keys( exec, { "type" }, "exec of " + what );
+  require_key( exec, "type", "exec of " + what );
+  // checked by hand for the message: fc's enum conversion reports a bad cast
+  FC_ASSERT( exec[ "type" ].is_string(), "exec type of ${w} is not a string", ("w", what) );
+  const std::string& t = exec[ "type" ].get_string();
+  FC_ASSERT( t == "log" || t == "socket",
+    "unknown exec type \"${t}\" in ${w} (known: log, socket)", ("t", t)("w", what) );
   if( rule.contains( "enrich" ) )
     FC_ASSERT( rule[ "enrich" ].is_array(), "enrich of ${w} is not a JSON array", ("w", what) );
   if( rule.contains( "delivery" ) )
@@ -50,12 +57,6 @@ void check_rule_object( const fc::variant& var, size_t index )
     FC_ASSERT( d == "irreversible" || d == "head",
       "unknown delivery \"${d}\" in ${w} (known: irreversible, head)", ("d", d)("w", what) );
   }
-}
-
-void check_exec( const exec_definition& exec, const std::string& what )
-{
-  FC_ASSERT( exec.type == "log",
-    "unknown exec type \"${t}\" in ${w} (known: log)", ("t", exec.type)("w", what) );
 }
 
 } // anonymous namespace
@@ -93,7 +94,6 @@ rules_config load_rules_file( const fc::path& path )
         ("a", inserted.first->second)("b", rule.name) );
       FC_ASSERT( !rule.match.empty(), "${w} has an empty match", ("w", what) );
       FC_ASSERT( rule.enrich.empty(), "${w} uses \"enrich\", which is not implemented yet", ("w", what) );
-      check_exec( rule.exec, what );
     }
 
     return config;
