@@ -3,6 +3,7 @@
 #include <hive/plugins/stinger/frame.hpp>
 #include <hive/plugins/stinger/rules.hpp>
 #include <hive/plugins/stinger/stinger_plugin.hpp>
+#include <hive/plugins/stinger/streams.hpp>
 
 #include <hive/chain/database.hpp>
 #include <hive/chain/notifications.hpp>
@@ -70,21 +71,6 @@ constexpr size_t STINGER_READY_BATCHES_MAX = 1024;
 /// drops are reported at most this often
 constexpr std::chrono::seconds DROP_LOG_INTERVAL{ 10 };
 
-/// One batch of frames for one delivery class, back to back, as the writer
-/// built them on its thread. For the irreversible class: a block's matches,
-/// handed to the sink once the block is irreversible. For the head class: a
-/// block's matches closed by its block_applied frame, handed over as the
-/// block is applied, or a lone irreversible or switch_fork marker.
-struct block_matches
-{
-  delivery_class           cls       = delivery_class::irreversible;
-  /// a lone irreversible or switch_fork frame for the head stream; never
-  /// dropped when the ready queue is full
-  bool                     marker    = false;
-  uint32_t                 block_num = 0;
-  uint32_t                 frames    = 0;
-  std::vector< std::byte > bytes;
-};
 
 /// be-tree event variable ids as returned by betree_add_*_variable, used as betree_set_variable slots
 struct event_slots
@@ -130,18 +116,20 @@ struct event_attribute_visitor
  * Irreversible, the default: a block's matches are delivered once the
  * block is irreversible, so the consumer never sees a match that can be
  * undone and the stream carries match frames only (frame.hpp). The
- * reversible window is the plugin's: frames accumulate in _current while
- * the block is applied, are sealed into _pending at post_apply_block,
- * dropped on fail_apply_block (the block was rolled back mid-application;
- * its leading transactions had already matched) and on switch_fork
- * (everything above the new head), and released at irreversible_block.
+ * reversible window is the plugin's (reversible_window, streams.hpp):
+ * frames accumulate in the block being applied, are sealed at
+ * post_apply_block, dropped on fail_apply_block (the block was rolled back
+ * mid-application; its leading transactions had already matched) and on
+ * switch_fork (everything above the new head), and released at
+ * irreversible_block.
  * With one-block irreversibility the window is normally one block deep.
  *
  * Head: a block's matches are delivered as the block is applied, closed by
  * a block_applied frame, so the consumer sees them a block or two before
  * the irreversible stream would show them and must be able to retract. The
- * stream carries switch_fork when blocks it has seen are popped and
- * irreversible when its retraction state for a height can go. A block that
+ * stream (head_stream, streams.hpp) carries switch_fork when blocks it has
+ * seen are popped and irreversible when its retraction state for a height
+ * can go. A block that
  * fails before post_apply_block never reaches this stream; one rolled back
  * after it - a later plugin's handler threw, or state migration did - is
  * retracted by a switch_fork below it from fail_apply_block, or, if the
@@ -188,8 +176,6 @@ public:
   void retract_from( uint32_t block_num );
   /// hand a batch to the sink; the writer's side of _ready
   void push_ready( block_matches&& b );
-  /// a head-stream batch holding the one frame the encoder just built
-  void push_head_marker( uint32_t block_num );
 
   /// the sink thread's body
   void sink_loop();
@@ -217,22 +203,14 @@ public:
   /// thread and its name on the sink thread; built in plugin_initialize
   /// together with the index and never written again
   std::map< uint64_t, const rule_definition* > _rules_by_id;
-  /// rules delivered at head; zero means the head stream does not exist
-  size_t _head_rules = 0;
 
   /// the writer thread's frame scratch
   std::unique_ptr< frame_encoder > _encoder;
 
-  /// writer-private: the block being applied, and the sealed blocks that
-  /// are not irreversible yet, in ascending block order
-  block_matches               _current;
-  std::deque< block_matches > _pending;
-  /// writer-private: the head-class batch of the block being applied, and
-  /// the last block the head stream was told about (0: nothing yet, so no
-  /// markers either) - what a switch_fork has to retract below
-  block_matches _head{ delivery_class::head };
-  uint32_t      _head_last_block        = 0;
-  uint32_t      _head_last_irreversible = 0;
+  /// writer-private: the two streams' bookkeeping (streams.hpp). The head
+  /// stream is enabled in plugin_initialize when a rule asks for it
+  reversible_window _window;
+  head_stream       _head;
   /// writer-private counters, folded into the shutdown report
   uint64_t _batches_released = 0;
   uint64_t _frames_released  = 0;
@@ -253,7 +231,7 @@ public:
   /// Serializes the signal handlers against stop_sink() on the shutdown
   /// thread. signals2's disconnect() stops new invocations but does not
   /// wait for one already running, and a handler may be mid-way through
-  /// _pending when stop_sink() wants to report it. A handler holds the lock
+  /// the window when stop_sink() wants to report it. A handler holds the lock
   /// for its whole body; stop_sink() takes it to set _stopping, which waits
   /// out a running handler, and every handler entered afterwards returns at
   /// once. Uncontended on every call but that one, so it costs nothing next
@@ -394,15 +372,10 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
   coords.trx_id       = note.trx_id;
   static_assert( std::is_same_v< betree_sub_t, uint64_t >, "rule ids are stored as uint64" );
   _encoder->encode_match( coords, matches->subs, matches->matched, note.op );
-  const auto append = [this]( block_matches& b )
-  {
-    b.bytes.insert( b.bytes.end(), _encoder->data(), _encoder->data() + _encoder->size() );
-    ++b.frames;
-  };
   if( to_irreversible )
-    append( _current );
+    _window.current().append( _encoder->data(), _encoder->size() );
   if( to_head )
-    append( _head );
+    _head.current().append( _encoder->data(), _encoder->size() );
 }
 
 void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
@@ -415,10 +388,10 @@ void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
   // that the chain undid without fail_apply_block or switch_fork (a throw
   // after post_apply_block in apply_block's storage flush does that). The
   // block being sealed is the real one; retract and drop the phantoms
-  if( _head_last_block >= note.block_num || ( !_pending.empty() && _pending.back().block_num >= note.block_num ) )
+  if( _head.last_block() >= note.block_num || _window.last_block() >= note.block_num )
   {
     elog( "stinger: block ${b} sealed while blocks up to ${h} were announced and ${p} pending - the chain undid them silently; retracting",
-      ("b", note.block_num)("h", _head_last_block)("p", _pending.empty() ? 0u : _pending.back().block_num) );
+      ("b", note.block_num)("h", _head.last_block())("p", _window.last_block()) );
     retract_from( note.block_num );
   }
 
@@ -426,25 +399,17 @@ void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
   // batch per validated block - the marker is the stream's clock, so a block
   // without matches is distinguishable from a stream that has not reached
   // it. Only validated blocks (ops were matched); replay never gets here.
-  if( _head_rules != 0 && _db.is_validating_block() )
+  if( _head.enabled() && _db.is_validating_block() )
   {
     _encoder->encode_block_applied( note.block_num, note.block_id );
-    _head.bytes.insert( _head.bytes.end(), _encoder->data(), _encoder->data() + _encoder->size() );
-    ++_head.frames;
-    _head.block_num = note.block_num;
-    push_ready( std::move( _head ) );
-    _head_last_block = note.block_num;
+    push_ready( _head.close( note.block_num, _encoder->data(), _encoder->size() ) );
   }
-  _head = block_matches{ delivery_class::head };
+  else
+    _head.discard_current();
 
   // Irreversible stream: seal the block's matches; a block without matches
   // (every block of a replay, where matching is off) leaves nothing to seal
-  if( _current.frames == 0 )
-    return;
-
-  _current.block_num = note.block_num;
-  _pending.push_back( std::move( _current ) );
-  _current = block_matches{};
+  _window.seal( note.block_num );
 }
 
 void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
@@ -459,12 +424,12 @@ void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
   // post_apply_block. But a throw after post_apply_block - another plugin's
   // handler, or state migration - also lands here, with both streams told
   // about the block: then it is retracted like a fork below it
-  if( _current.frames != 0 || _head.frames != 0 )
-    dlog( "stinger: block ${b} failed to apply - ${n} match(es) dropped",
-      ("b", note.block_num)("n", _current.frames + _head.frames) );
-  _current = block_matches{};
-  _head    = block_matches{ delivery_class::head };
-  if( _head_last_block >= note.block_num || ( !_pending.empty() && _pending.back().block_num >= note.block_num ) )
+  const uint32_t frames = _window.current().frames + _head.current().frames;
+  if( frames != 0 )
+    dlog( "stinger: block ${b} failed to apply - ${n} match(es) dropped", ("b", note.block_num)("n", frames) );
+  _window.discard_current();
+  _head.discard_current();
+  if( _head.last_block() >= note.block_num || _window.last_block() >= note.block_num )
   {
     wlog( "stinger: block ${b} rolled back after it was announced - retracting", ("b", note.block_num) );
     retract_from( note.block_num );
@@ -473,15 +438,11 @@ void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
 
 void stinger_plugin_impl::retract_from( uint32_t block_num )
 {
-  // Irreversible stream: the sealed blocks at or above block_num go
-  while( !_pending.empty() && _pending.back().block_num >= block_num )
-    _pending.pop_back();
-  // Head stream: the consumer discards everything above block_num - 1
-  if( _head_last_block >= block_num )
+  _window.drop_from( block_num );
+  if( const auto below = _head.retract_from( block_num ) )
   {
-    _encoder->encode_switch_fork( block_num - 1 );
-    push_head_marker( block_num - 1 );
-    _head_last_block = block_num - 1;
+    _encoder->encode_switch_fork( *below );
+    push_ready( head_stream::marker( *below, _encoder->data(), _encoder->size() ) );
   }
 }
 
@@ -491,21 +452,14 @@ void stinger_plugin_impl::on_irreversible_block( uint32_t block_num )
   if( !scope )
     return;
 
-  // Irreversible stream: release every sealed block up to and including
-  // block_num; _pending is ascending so they are at the front
-  while( !_pending.empty() && _pending.front().block_num <= block_num )
-  {
-    push_ready( std::move( _pending.front() ) );
-    _pending.pop_front();
-  }
+  // Irreversible stream: release every sealed block up to and including block_num
+  _window.release_up_to( block_num, [this]( block_matches&& b ) { push_ready( std::move( b ) ); } );
 
-  // Head stream: the consumer can drop its retraction state up to here.
-  // Once per height - the chain re-notifies a height after a fork switch
-  if( _head_last_block != 0 && block_num > _head_last_irreversible )
+  // Head stream: the consumer can drop its retraction state up to here
+  if( _head.irreversible( block_num ) )
   {
     _encoder->encode_irreversible( block_num );
-    push_head_marker( block_num );
-    _head_last_irreversible = block_num;
+    push_ready( head_stream::marker( block_num, _encoder->data(), _encoder->size() ) );
   }
 }
 
@@ -519,39 +473,23 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   // afterwards and its ops are matched fresh. Fires between the pops and
   // the first apply, when switching back after a block of the new branch
   // failed, and at startup after the state is undone to the last
-  // irreversible block, when nothing is pending. _current is empty at all
-  // three unless a block was undone without a signal; dropped either way
-  uint32_t frames = _current.frames + _head.frames;
-  size_t   blocks = 0;
-  while( !_pending.empty() && _pending.back().block_num > new_head_block_num )
-  {
-    frames += _pending.back().frames;
-    _pending.pop_back();
-    ++blocks;
-  }
-  _current = block_matches{};
-  _head    = block_matches{ delivery_class::head };
-  if( blocks != 0 || frames != 0 )
+  // irreversible block, when nothing is pending. The block being applied is
+  // empty at all three unless a block was undone without a signal; dropped
+  // either way
+  const uint32_t held = _window.current().frames + _head.current().frames;
+  _window.discard_current();
+  _head.discard_current();
+  const auto dropped = _window.drop_from( new_head_block_num + 1 );
+  if( dropped.blocks != 0 || held != 0 )
     dlog( "stinger: fork switch to block ${b} - ${k} block(s), ${n} match(es) dropped",
-      ("b", new_head_block_num)("k", blocks)("n", frames) );
+      ("b", new_head_block_num)("k", dropped.blocks)("n", dropped.frames + held) );
 
   // Head stream: retract what it has seen above the new head, if anything
-  if( _head_last_block > new_head_block_num )
+  if( const auto below = _head.switch_fork( new_head_block_num ) )
   {
-    _encoder->encode_switch_fork( new_head_block_num );
-    push_head_marker( new_head_block_num );
-    _head_last_block = new_head_block_num;
+    _encoder->encode_switch_fork( *below );
+    push_ready( head_stream::marker( *below, _encoder->data(), _encoder->size() ) );
   }
-}
-
-void stinger_plugin_impl::push_head_marker( uint32_t block_num )
-{
-  block_matches b{ delivery_class::head };
-  b.marker    = true;
-  b.block_num = block_num;
-  b.frames    = 1;
-  b.bytes.assign( _encoder->data(), _encoder->data() + _encoder->size() );
-  push_ready( std::move( b ) );
 }
 
 void stinger_plugin_impl::push_ready( block_matches&& b )
@@ -755,18 +693,14 @@ void stinger_plugin_impl::stop_sink()
   hive::utilities::disconnect_signal( switch_fork_connection );
   // 3. this thread owns the writer-private state now. What is not
   // irreversible is not delivered; say what that was
-  const uint32_t held_frames = _current.frames;
-  if( !_pending.empty() || held_frames != 0 )
+  const uint32_t held_frames = _window.current().frames;
+  if( !_window.empty() || held_frames != 0 )
   {
-    uint64_t frames = held_frames;
-    for( const auto& b : _pending )
-      frames += b.frames;
     ilog( "stinger: ${k} block(s) ${a}..${z} with ${n} match(es) were not irreversible at shutdown and are not delivered",
-      ("k", _pending.size() + ( held_frames != 0 ? 1 : 0 ))
-      ("a", _pending.empty() ? 0u : _pending.front().block_num)
-      ("z", _pending.empty() ? 0u : _pending.back().block_num)("n", frames) );
-    _pending.clear();
-    _current = block_matches{};
+      ("k", _window.size() + ( held_frames != 0 ? 1 : 0 ))
+      ("a", _window.first_block())("z", _window.last_block())("n", _window.frames() + held_frames) );
+    _window.drop_from( 0 );
+    _window.discard_current();
   }
   // 4. the stream has ended; set after the final release, under the same
   // mutex, so the sink's "stopped and empty" means drained
@@ -835,6 +769,7 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     my->_matcher.reset( betree_make() );
     FC_ASSERT( my->_matcher, "stinger: failed to create be-tree matcher" );
     my->_slots = detail::declare_rule_attributes( my->_matcher.get() );
+    size_t head_rules = 0;
     for( const auto& rule : my->rules.rules )
     {
       FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
@@ -842,10 +777,11 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
         ("n", rule.name)("i", rule.id)("e", rule.match) );
       my->_rules_by_id.emplace( rule.id, &rule );
       if( rule.delivery == delivery_class::head )
-        ++my->_head_rules;
+        ++head_rules;
     }
+    my->_head = head_stream( head_rules != 0 );
     ilog( "stinger: subscription index built, ${n} rule(s), ${h} delivered at head",
-      ("n", my->rules.rules.size())("h", my->_head_rules) );
+      ("n", my->rules.rules.size())("h", head_rules) );
 
     // the encoder and the sink thread must exist before the handlers
     // connect, for the same reason as the index; the sink reads
