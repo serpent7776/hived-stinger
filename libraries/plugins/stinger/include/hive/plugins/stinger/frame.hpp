@@ -85,6 +85,14 @@ using bounded_stream = fc::datastream< bounded_window >;
  * native endian, in-process only - it is not an on-the-wire format, so it
  * carries no version until a sink writes it to a file or a socket.
  *
+ * Match frames are the stream for rules delivered at irreversibility: a
+ * block's buffer holds that block's matches and nothing else, since the
+ * block cannot be undone. Rules delivered at head also get the lifecycle
+ * frames a consumer needs to retract: block_applied seals a block and names
+ * its branch, switch_fork says everything above a height is gone, and
+ * irreversible says everything up to a height is final and its retraction
+ * state can go.
+ *
  *   header (8 bytes)
  *     uint32 len             payload bytes following this header
  *     uint8  kind            frame_kind

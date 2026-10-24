@@ -524,10 +524,6 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
       case frame_kind::match:
         deliver_match( decode_match( f ) );
         break;
-      case frame_kind::block_applied:
-      case frame_kind::irreversible:
-      case frame_kind::switch_fork:
-        break;  // not emitted
       default:
         FC_THROW_EXCEPTION( fc::assert_exception, "stinger: unknown frame kind ${k} in block ${b}",
           ("k", f.header.kind)("b", b.block_num) );
