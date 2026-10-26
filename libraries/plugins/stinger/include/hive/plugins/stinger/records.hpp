@@ -20,9 +20,17 @@ namespace hive { namespace plugins { namespace stinger {
  * started, across all connections, so a consumer that reconnects can tell
  * how many it missed from the first `seq` it sees.
  *
- *   {"kind":"hello","version":1,"next_seq":N}
+ *   {"kind":"hello","version":1,"next_seq":N,"matching_from":B}
  *     first line of every connection; carries no seq of its own. `version`
  *     is this format's; a consumer should refuse one it does not know.
+ *     `matching_from` is the lowest block whose operations the node has
+ *     matched, or null while it has matched none yet - a node that is
+ *     still syncing with matching off (stinger_plugin.cpp). Nothing below
+ *     it was ever looked at, so a stream with no matches is not a stream
+ *     that missed them. It can only go down, when a fork reaches below the
+ *     first matched block and the chain re-applies lower blocks: a
+ *     consumer greeted before that sees them after the switch_fork, below
+ *     its hello's value; one greeted after gets the new value.
  *
  *   {"kind":"match","seq":N,"delivery":"irreversible"|"head","rules":["..."],
  *    "block":B,"timestamp":"...","trx_id":"...","trx_in_block":T,"op_in_trx":O,
@@ -57,7 +65,8 @@ public:
 
   /// Each returns the record as one line, newline included, in a buffer
   /// that the next call overwrites.
-  const std::string& hello();
+  /// `matching_from` is the first block matched, 0 for none yet (rendered null)
+  const std::string& hello( uint32_t matching_from );
   const std::string& match( delivery_class cls, const std::vector< std::string_view >& rules, const match_frame& m );
   const std::string& block_applied( uint32_t block_num, const protocol::block_id_type& block_id );
   const std::string& irreversible( uint32_t block_num );

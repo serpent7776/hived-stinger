@@ -41,6 +41,7 @@ extern "C" {
 
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
 #define STINGER_SOCKET_KEY     "stinger-socket"
+#define STINGER_MATCH_DURING_SYNC_KEY "stinger-match-during-sync"
 
 namespace hive { namespace plugins { namespace stinger {
 
@@ -150,9 +151,15 @@ struct event_attribute_visitor
  * after it - a later plugin's handler threw, or state migration did - is
  * retracted by a switch_fork below it from fail_apply_block, or, if the
  * chain undid it without a signal, when the next block at that height is
- * sealed. Nothing is emitted until the first validated block, which keeps
- * replay and startup out of the stream. A rule file without head rules
- * produces none of this.
+ * sealed. A rule file without head rules produces none of this.
+ *
+ * Only validated blocks are matched, never replayed ones, and by default
+ * only once the node is live: matching is armed by the chain's
+ * end_of_syncing signal, so a node catching up from a cold start neither
+ * floods its consumers with years of history nor pays the matcher on every
+ * synced block. stinger-match-during-sync arms it at startup instead, for a
+ * consumer that wants the backfill. Either way the first block matched is
+ * reported in the socket's hello (records.hpp) as matching_from.
  *
  * An operation matched by rules of both classes puts the same frame, with
  * every matched rule id, in both batches; the sink reports to each stream
@@ -194,6 +201,7 @@ public:
   void on_fail_apply_block( const block_notification& note );
   void on_irreversible_block( uint32_t block_num );
   void on_switch_fork( uint32_t new_head_block_num );
+  void on_end_of_syncing();
 
   /// both streams forget blocks at or above block_num: pending blocks are
   /// dropped and the head stream gets a switch_fork below it
@@ -264,6 +272,14 @@ public:
   std::mutex _writer_mutex;
   /// under _writer_mutex
   bool       _stopping = false;
+  /// under _writer_mutex: operations are matched. Set at initialization by
+  /// stinger-match-during-sync, otherwise by the end_of_syncing signal
+  bool       _armed = false;
+  /// the lowest block whose operations were matched; 0 until there is
+  /// one. Usually the first matched block, but a fork that reaches below
+  /// it re-applies, and so matches, lower blocks. Written on the writer
+  /// thread, read by the sink for the hello record
+  std::atomic< uint32_t > _matching_from{ 0 };
   /// set by the sink thread if it exits on an exception: handlers stop
   /// producing for a sink that will never drain, and stop_sink() reports it
   std::atomic< bool >     _sink_failed{ false };
@@ -287,6 +303,7 @@ public:
   chain::database::signal_connection_ptr fail_apply_block_connection;
   chain::database::signal_connection_ptr irreversible_block_connection;
   chain::database::signal_connection_ptr switch_fork_connection;
+  chain::database::signal_connection_ptr end_of_syncing_connection;
 };
 
 /**
@@ -325,8 +342,10 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
   if( !scope )
     return;
 
-  // Only ops applied as part of an actual block may produce matches:
-  if( !_db.is_validating_block() )
+  // Only ops of a validated block may produce matches, and only once the
+  // node is live (or from the start, with stinger-match-during-sync); a
+  // replayed block is never matched
+  if( !_armed || !_db.is_validating_block() )
     return;
 
   std::optional< protocol::asset > amount;
@@ -427,11 +446,22 @@ void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
     retract_from( note.block_num );
   }
 
+  // The block's operations went through the matcher: validated, and the
+  // plugin armed. The lowest such block is what the hello record reports
+  const bool matched = _armed && _db.is_validating_block();
+  if( matched )
+  {
+    const uint32_t lowest = _matching_from.load( std::memory_order_relaxed );
+    if( lowest == 0 || note.block_num < lowest )
+      _matching_from.store( note.block_num, std::memory_order_relaxed );
+  }
+
   // Head stream: the block's matches, if any, closed by block_applied, one
-  // batch per validated block - the marker is the stream's clock, so a block
+  // batch per matched block - the marker is the stream's clock, so a block
   // without matches is distinguishable from a stream that has not reached
-  // it. Only validated blocks (ops were matched); replay never gets here.
-  if( _head.enabled() && _db.is_validating_block() )
+  // it. A replayed block, or one applied before the node was live, never
+  // gets here.
+  if( _head.enabled() && matched )
   {
     _encoder->encode_block_applied( note.block_num, note.block_id );
     push_ready( _head.close( note.block_num, _encoder->data(), _encoder->size() ) );
@@ -493,6 +523,19 @@ void stinger_plugin_impl::on_irreversible_block( uint32_t block_num )
     _encoder->encode_irreversible( block_num );
     push_ready( head_stream::marker( block_num, _encoder->data(), _encoder->size() ) );
   }
+}
+
+void stinger_plugin_impl::on_end_of_syncing()
+{
+  handler_scope scope( *this );
+  if( !scope || _armed )
+    return;
+
+  // Fired by the writer thread between blocks when the head block is within
+  // a minute of now (or at startup, when the chain runs without P2P), so
+  // the next block applied is matched whole
+  _armed = true;
+  ilog( "stinger: node is live at block ${b} - matching from the next one", ("b", _db.head_block_num()) );
 }
 
 void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
@@ -592,7 +635,7 @@ void stinger_plugin_impl::sink_loop()
       }
       // before the batch, so a consumer that just connected gets it
       if( _socket )
-        _socket->poll( _records.hello() );
+        _socket->poll( _records.hello( _matching_from.load( std::memory_order_relaxed ) ) );
       if( !have )
         continue;
       // a decode tripwire or a sink bug drops this block, not hived: an
@@ -759,6 +802,7 @@ void stinger_plugin_impl::stop_sink()
   hive::utilities::disconnect_signal( fail_apply_block_connection );
   hive::utilities::disconnect_signal( irreversible_block_connection );
   hive::utilities::disconnect_signal( switch_fork_connection );
+  hive::utilities::disconnect_signal( end_of_syncing_connection );
   // 3. this thread owns the writer-private state now. What is not
   // irreversible is not delivered; say what that was
   const uint32_t held_frames = _window.current().frames;
@@ -827,6 +871,8 @@ void stinger_plugin::set_program_options( boost::program_options::options_descri
     ( STINGER_RULES_FILE_KEY, boost::program_options::value<std::string>(), "Path to the file with stinger rule definitions." )
     ( STINGER_SOCKET_KEY, boost::program_options::value<std::string>(),
       "Path of the unix socket the stinger match stream is served on, as newline-delimited JSON. Required when a rule's exec type is socket." )
+    ( STINGER_MATCH_DURING_SYNC_KEY, boost::program_options::value<bool>()->default_value( false ),
+      "Match operations of blocks received while the node is still syncing (backfill). By default matching starts when the node enters live mode. Replayed blocks are never matched." )
     ;
 }
 
@@ -862,6 +908,13 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     ilog( "stinger: subscription index built, ${n} rule(s), ${h} delivered at head",
       ("n", my->rules.rules.size())("h", head_rules) );
 
+    // when matching starts: now, or when the chain says the node is live
+    my->_armed = options.at( STINGER_MATCH_DURING_SYNC_KEY ).as< bool >();
+    if( my->_armed )
+      ilog( "stinger: matching during sync (" STINGER_MATCH_DURING_SYNC_KEY ")" );
+    else
+      ilog( "stinger: matching starts when the node is live" );
+
     // the socket, if asked for; a rule that needs one and finds none is a
     // configuration error, found now and not at the first match
     const size_t socket_rules = std::count_if( my->rules.rules.begin(), my->rules.rules.end(),
@@ -892,6 +945,8 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
       [&]( uint32_t block_num ) { try { my->on_irreversible_block( block_num ); } FC_LOG_AND_RETHROW() }, *this, 0 );
     my->switch_fork_connection = my->_db.add_switch_fork_handler(
       [&]( uint32_t new_head_block_num ) { try { my->on_switch_fork( new_head_block_num ); } FC_LOG_AND_RETHROW() }, *this, 0 );
+    my->end_of_syncing_connection = my->_db.add_end_of_syncing_handler(
+      [&]() { try { my->on_end_of_syncing(); } FC_LOG_AND_RETHROW() }, *this, 0 );
 
     ilog( "stinger: plugin_initialize() end" );
   } FC_CAPTURE_AND_RETHROW()

@@ -25,10 +25,11 @@ record_writer::record_writer( size_t line_limit )
   FC_ASSERT( line_limit > 0, "the line limit must be positive" );
 }
 
-const std::string& record_writer::hello()
+const std::string& record_writer::hello( uint32_t matching_from )
 {
   fc::mutable_variant_object obj;
-  obj( "kind", "hello" )( "version", FORMAT_VERSION )( "next_seq", _next_seq );
+  obj( "kind", "hello" )( "version", FORMAT_VERSION )( "next_seq", _next_seq )
+     ( "matching_from", matching_from != 0 ? fc::variant( matching_from ) : fc::variant() );
   render( obj, _line );
   return _line;
 }

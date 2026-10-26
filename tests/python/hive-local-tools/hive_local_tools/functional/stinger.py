@@ -28,6 +28,7 @@ class StingerNodeConfig(NodeConfig):
 
     stinger_rules_file: str | None = None
     stinger_socket: str | None = None
+    stinger_match_during_sync: bool | None = None
 
 
 # NodeConfig resolves a member's type through the concrete class's own annotations, which do not include the
@@ -43,12 +44,15 @@ def rule(name: str, match: str, *, exec_type: str = "socket", delivery: str | No
     return entry
 
 
-def enable_stinger(node: tt.AnyNode, rules: Iterable[dict[str, Any]], directory: Path) -> Path:
+def enable_stinger(
+    node: tt.AnyNode, rules: Iterable[dict[str, Any]], directory: Path, *, match_during_sync: bool = False
+) -> Path:
     """
     Configure `node` (not yet running) to load the stinger plugin with `rules` and serve them on a unix socket.
 
     The rules file and the socket are placed in `directory`, which must be short enough for a unix socket address
-    (108 bytes) - the node's own directory usually is not. Returns the socket path.
+    (108 bytes) - the node's own directory usually is not. By default the plugin starts matching when the node enters
+    live mode; `match_during_sync` makes it match synced blocks too. Returns the socket path.
     """
     directory.mkdir(parents=True, exist_ok=True)
     rules_file = directory / "stinger_rules.json"
@@ -62,6 +66,7 @@ def enable_stinger(node: tt.AnyNode, rules: Iterable[dict[str, Any]], directory:
         **msgspec.structs.asdict(current),
         stinger_rules_file=str(rules_file),
         stinger_socket=str(socket_path),
+        stinger_match_during_sync=match_during_sync,
     )
     # the executable keeps its config in a name-mangled attribute of beekeepy's Executable
     process._Executable__config = replaced  # type: ignore[attr-defined] # noqa: SLF001
@@ -162,6 +167,8 @@ def assert_well_formed(records: list[Record]) -> None:
     assert records, "no records at all"
     assert records[0]["kind"] == "hello", f"first record is {records[0]}"
     assert records[0]["version"] == 1
+    matching_from = records[0]["matching_from"]
+    assert matching_from is None or (isinstance(matching_from, int) and matching_from >= 1), records[0]
     sequenced = [r for r in records if "seq" in r]
     expected = records[0]["next_seq"]
     for r in sequenced:
@@ -169,3 +176,12 @@ def assert_well_formed(records: list[Record]) -> None:
         expected += 1
     for r in sequenced:
         assert r["kind"] in {"match", "block_applied", "irreversible", "switch_fork"}, r
+    # nothing below the lowest matched block is reported, unless a fork reached below it: then the chain re-applied,
+    # and the node matched, blocks below it, announced after the switch_fork that retracted the others
+    if matching_from is not None:
+        floor = matching_from
+        for r in sequenced:
+            if r["kind"] == "switch_fork" and r["block"] < floor:
+                floor = r["block"] + 1
+            elif r["kind"] in {"match", "block_applied"}:
+                assert r["block"] >= floor, f"{r} is below matching_from={matching_from} (floor {floor})"

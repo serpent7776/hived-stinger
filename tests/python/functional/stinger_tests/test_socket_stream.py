@@ -137,3 +137,81 @@ def test_a_second_consumer_gets_the_same_stream(tmp_path: Path) -> None:
     common = min(len(first_from_join), len(second_sequenced))
     assert common > 0
     assert first_from_join[:common] == second_sequenced[:common]
+
+
+# the chain plugin calls a node live once its head block is within a minute of now; a joiner has to sync at least
+# this many 3-second blocks to have been "syncing" in that sense
+BLOCKS_OLDER_THAN_LIVE_SYNC_GAP = 25
+
+
+def _join_an_old_chain(tmp_path: Path, *, match_during_sync: bool) -> tuple[tt.ApiNode, StreamReader, int, int]:
+    """
+    A producer makes a chain older than the live-sync gap, then a stinger node joins and syncs it. Returns the joiner,
+    a consumer connected before the joiner went live, the producer's head once the joiner was live, and
+    `matching_from` as a consumer connecting after the joiner is live sees it.
+    """
+    producer = tt.InitNode()
+    joiner = tt.ApiNode()
+    socket_path = enable_stinger(
+        joiner, [rule("everything", "op_type >= 0", delivery="head")], tmp_path, match_during_sync=match_during_sync
+    )
+    producer.run()
+    producer.wait_for_block_with_number(BLOCKS_OLDER_THAN_LIVE_SYNC_GAP)
+
+    joiner.config.p2p_seed_node.append(producer.p2p_endpoint)
+    joiner.run(wait_for_live=False)
+    early = StreamReader(socket_path)  # the socket exists from plugin initialization, before any block
+    joiner.wait_for_live_mode(timeout=120)
+    # the joiner went live after a sync batch ending at or below this height
+    head_when_live = producer.get_last_block_number()
+    joiner.wait_number_of_blocks(2)
+    late = StreamReader(socket_path)
+    late_hello = late.wait_for(lambda rs: bool(rs), what="the late consumer's hello")[0]
+    late.close()
+    assert late_hello["kind"] == "hello"
+    assert late_hello["matching_from"] is not None, "live for two blocks and still nothing matched"
+    return joiner, early, head_when_live, late_hello["matching_from"]
+
+
+def _applied_blocks_are_contiguous_from(records: list[dict], matching_from: int) -> None:
+    applied = [m["block"] for m in markers(records, "block_applied")]
+    assert applied, "no block_applied markers"
+    assert applied == list(range(applied[0], applied[0] + len(applied))), f"block_applied not contiguous: {applied}"
+    if records[0]["matching_from"] is None:
+        # this consumer was there before the first matched block, so it saw it
+        assert applied[0] == matching_from, f"first block_applied {applied[0]} but matching_from {matching_from}"
+    else:
+        assert applied[0] >= matching_from
+
+
+@pytest.mark.testnet
+def test_matching_starts_when_the_node_is_live(tmp_path: Path) -> None:
+    """
+    By default a joining node syncs the old blocks with matching off and arms the matcher when it goes live: hello
+    says where, every block from there on is reported, nothing below it ever is.
+    """
+    joiner, early, head_when_live, matching_from = _join_an_old_chain(tmp_path, match_during_sync=False)
+    records = early.wait_for(lambda rs: len(markers(rs, "block_applied")) >= 2, what="two blocks at head")
+    assert_well_formed(records)
+    # the gate held through the blocks older than the gap, and opened with the first block after the sync batch that
+    # made the joiner live - not some later one
+    assert matching_from > 1, "the synced blocks were matched"
+    assert matching_from <= head_when_live + 1, f"matching only started at {matching_from}, live by {head_when_live}"
+    _applied_blocks_are_contiguous_from(records, matching_from)
+    assert all(m["block"] >= matching_from for m in matches(records))
+    joiner.close()
+    assert_well_formed(early.wait_for_eof())
+
+
+@pytest.mark.testnet
+def test_match_during_sync_backfills_the_synced_blocks(tmp_path: Path) -> None:
+    """With stinger-match-during-sync the synced blocks are matched too: the stream starts at block 1."""
+    joiner, early, _, matching_from = _join_an_old_chain(tmp_path, match_during_sync=True)
+    records = early.wait_for(lambda rs: len(markers(rs, "block_applied")) >= 2, what="two blocks at head")
+    assert_well_formed(records)
+    assert matching_from == 1
+    _applied_blocks_are_contiguous_from(records, matching_from)
+    if records[0]["matching_from"] is None:
+        assert any(m["block"] == 1 for m in matches(records)), "block 1 has virtual operations and none matched"
+    joiner.close()
+    assert_well_formed(early.wait_for_eof())

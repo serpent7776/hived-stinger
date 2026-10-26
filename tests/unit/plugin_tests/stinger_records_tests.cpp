@@ -85,7 +85,7 @@ BOOST_AUTO_TEST_CASE( hello_carries_the_version_and_the_next_seq )
 {
   record_writer w( NO_LIMIT );
   BOOST_CHECK_EQUAL( w.next_seq(), 1u );
-  auto rec = parse( w.hello() );
+  auto rec = parse( w.hello( 0 ) );
   BOOST_CHECK_EQUAL( rec[ "kind" ].as_string(), "hello" );
   BOOST_CHECK_EQUAL( rec[ "version" ].as_uint64(), record_writer::FORMAT_VERSION );
   BOOST_CHECK_EQUAL( rec[ "next_seq" ].as_uint64(), 1u );
@@ -93,7 +93,17 @@ BOOST_AUTO_TEST_CASE( hello_carries_the_version_and_the_next_seq )
   // a greeting does not consume a seq
   BOOST_CHECK_EQUAL( w.next_seq(), 1u );
   w.irreversible( 5 );
-  BOOST_CHECK_EQUAL( parse( w.hello() )[ "next_seq" ].as_uint64(), 2u );
+  BOOST_CHECK_EQUAL( parse( w.hello( 0 ) )[ "next_seq" ].as_uint64(), 2u );
+}
+
+BOOST_AUTO_TEST_CASE( hello_says_where_matching_started )
+{
+  record_writer w( NO_LIMIT );
+  // nothing matched yet: the key is there, and null
+  auto rec = parse( w.hello( 0 ) );
+  BOOST_CHECK( rec.contains( "matching_from" ) );
+  BOOST_CHECK( rec[ "matching_from" ].is_null() );
+  BOOST_CHECK_EQUAL( parse( w.hello( 4321 ) )[ "matching_from" ].as_uint64(), 4321u );
 }
 
 BOOST_AUTO_TEST_CASE( match_record )
