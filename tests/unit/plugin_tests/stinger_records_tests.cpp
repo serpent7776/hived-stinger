@@ -81,29 +81,74 @@ fc::variant_object parse( const std::string& line )
 
 BOOST_AUTO_TEST_SUITE( stinger_records )
 
-BOOST_AUTO_TEST_CASE( hello_carries_the_version_and_the_next_seq )
+BOOST_AUTO_TEST_CASE( hello_carries_the_version_and_the_seq_of_the_last_record )
 {
   record_writer w( NO_LIMIT );
   BOOST_CHECK_EQUAL( w.next_seq(), 1u );
-  auto rec = parse( w.hello( 0 ) );
+  BOOST_CHECK_EQUAL( w.last_seq(), 0u );
+  auto rec = parse( w.hello( stream_position{} ) );
   BOOST_CHECK_EQUAL( rec[ "kind" ].as_string(), "hello" );
   BOOST_CHECK_EQUAL( rec[ "version" ].as_uint64(), record_writer::FORMAT_VERSION );
-  BOOST_CHECK_EQUAL( rec[ "next_seq" ].as_uint64(), 1u );
-  BOOST_CHECK( !rec.contains( "seq" ) );
+  // nothing rendered yet: the greeting stands at 0, the first record will carry 1
+  BOOST_CHECK_EQUAL( rec[ "seq" ].as_uint64(), 0u );
   // a greeting does not consume a seq
   BOOST_CHECK_EQUAL( w.next_seq(), 1u );
-  w.irreversible( 5 );
-  BOOST_CHECK_EQUAL( parse( w.hello( 0 ) )[ "next_seq" ].as_uint64(), 2u );
+  BOOST_CHECK_EQUAL( parse( w.irreversible( 5 ) )[ "seq" ].as_uint64(), 1u );
+  // and stands at the last record rendered, one below what follows it
+  BOOST_CHECK_EQUAL( parse( w.hello( stream_position{} ) )[ "seq" ].as_uint64(), 1u );
+  BOOST_CHECK_EQUAL( w.next_seq(), 2u );
 }
 
-BOOST_AUTO_TEST_CASE( hello_says_where_matching_started )
+BOOST_AUTO_TEST_CASE( hello_says_where_the_streams_stand )
 {
   record_writer w( NO_LIMIT );
-  // nothing matched yet: the key is there, and null
-  auto rec = parse( w.hello( 0 ) );
-  BOOST_CHECK( rec.contains( "matching_from" ) );
-  BOOST_CHECK( rec[ "matching_from" ].is_null() );
-  BOOST_CHECK_EQUAL( parse( w.hello( 4321 ) )[ "matching_from" ].as_uint64(), 4321u );
+  // neither stream has started: the keys are there, and null
+  auto rec = parse( w.hello( stream_position{} ) );
+  BOOST_CHECK( rec.contains( "delivered" ) );
+  auto delivered = rec[ "delivered" ].get_object();
+  BOOST_CHECK( delivered.contains( "head" ) );
+  BOOST_CHECK( delivered[ "head" ].is_null() );
+  BOOST_CHECK( delivered.contains( "irreversible" ) );
+  BOOST_CHECK( delivered[ "irreversible" ].is_null() );
+
+  stream_position pos;
+  pos.head_block   = 4321;
+  pos.head_id      = fc::ripemd160::hash( std::string( "head" ) );
+  pos.irreversible = 4300;
+  rec = parse( w.hello( pos ) );
+  delivered = rec[ "delivered" ].get_object();
+  BOOST_CHECK_EQUAL( delivered[ "head" ][ "block" ].as_uint64(), 4321u );
+  BOOST_CHECK_EQUAL( delivered[ "head" ][ "block_id" ].as_string(), pos.head_id.str() );
+  BOOST_CHECK_EQUAL( delivered[ "irreversible" ].as_uint64(), 4300u );
+
+  // one stream can stand somewhere while the other has not started
+  pos.head_block = 0;
+  delivered = parse( w.hello( pos ) )[ "delivered" ].get_object();
+  BOOST_CHECK( delivered[ "head" ].is_null() );
+  BOOST_CHECK_EQUAL( delivered[ "irreversible" ].as_uint64(), 4300u );
+
+  // an irreversible stream that started before the chain had an irreversible
+  // block stands at 0: the consumer backfills nothing. Not null, which is a
+  // stream that has not started
+  pos.irreversible = 0;
+  delivered = parse( w.hello( pos ) )[ "delivered" ].get_object();
+  BOOST_CHECK( !delivered[ "irreversible" ].is_null() );
+  BOOST_CHECK_EQUAL( delivered[ "irreversible" ].as_uint64(), 0u );
+}
+
+BOOST_AUTO_TEST_CASE( irreversible_position_floors_at_the_lowest_matched_block )
+{
+  // nothing matched: the stream has not started, whatever the chain made irreversible (a sync with matching off)
+  BOOST_CHECK( !irreversible_position( 0, 0 ) );
+  BOOST_CHECK( !irreversible_position( 5000, 0 ) );
+  // matched from the first block on an empty chain: nothing to backfill, and that is 0, not none
+  BOOST_CHECK_EQUAL( *irreversible_position( 0, 1 ), 0u );
+  // the chain's irreversible height once it is at or above the first matched block
+  BOOST_CHECK_EQUAL( *irreversible_position( 4300, 4000 ), 4300u );
+  BOOST_CHECK_EQUAL( *irreversible_position( 3999, 4000 ), 3999u );
+  // armed at 4000 with the chain irreversible only up to 3990: the blocks 3991..3999 were never matched, so the
+  // position covers them - the consumer backfills them once they are irreversible
+  BOOST_CHECK_EQUAL( *irreversible_position( 3990, 4000 ), 3999u );
 }
 
 BOOST_AUTO_TEST_CASE( match_record )
@@ -222,10 +267,12 @@ BOOST_AUTO_TEST_CASE( markers )
   BOOST_CHECK_EQUAL( rec[ "block" ].as_uint64(), 9u );
   BOOST_CHECK( !rec.contains( "block_id" ) );
 
-  rec = parse( w.switch_fork( 8 ) );
+  const block_id_type fork_id = fc::ripemd160::hash( std::string( "common" ) );
+  rec = parse( w.switch_fork( 8, fork_id ) );
   BOOST_CHECK_EQUAL( rec[ "kind" ].as_string(), "switch_fork" );
   BOOST_CHECK_EQUAL( rec[ "seq" ].as_uint64(), 3u );
   BOOST_CHECK_EQUAL( rec[ "block" ].as_uint64(), 8u );
+  BOOST_CHECK_EQUAL( rec[ "block_id" ].as_string(), fork_id.str() );
   BOOST_CHECK_EQUAL( w.next_seq(), 4u );
 }
 

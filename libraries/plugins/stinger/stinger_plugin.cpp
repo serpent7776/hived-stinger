@@ -158,8 +158,8 @@ struct event_attribute_visitor
  * end_of_syncing signal, so a node catching up from a cold start neither
  * floods its consumers with years of history nor pays the matcher on every
  * synced block. stinger-match-during-sync arms it at startup instead, for a
- * consumer that wants the backfill. Either way the first block matched is
- * reported in the socket's hello (records.hpp) as matching_from.
+ * consumer that wants the backfill. Either way the socket's hello
+ * (records.hpp) tells a consumer where each stream stands when it connects.
  *
  * An operation matched by rules of both classes puts the same frame, with
  * every matched rule id, in both batches; the sink reports to each stream
@@ -175,9 +175,11 @@ struct event_attribute_visitor
  *
  * All writer state is touched under _writer_mutex only: by the writer
  * thread, and by the main thread for the irreversible and fork signals the
- * chain fires during startup and replay, when it is empty. The one
+ * chain fires during startup and replay, when it is empty. The
  * cross-thread point to the sink is _ready, a mutex-guarded queue of
- * batches it waits on, in the writer's order, so each stream is in order.
+ * batches it waits on, in the writer's order, so each stream is in order;
+ * beside it two atomics the writer sets for the sink's hello record, and
+ * _sink_failed the other way.
  * The writer never blocks on the sink: a full queue drops the oldest batch,
  * counted and warned about.
  *
@@ -204,8 +206,9 @@ public:
   void on_end_of_syncing();
 
   /// both streams forget blocks at or above block_num: pending blocks are
-  /// dropped and the head stream gets a switch_fork below it
-  void retract_from( uint32_t block_num );
+  /// dropped and the head stream gets a switch_fork below it, naming
+  /// `prev_id`, the block at block_num - 1
+  void retract_from( uint32_t block_num, const protocol::block_id_type& prev_id );
   /// hand a batch to the sink; the writer's side of _ready
   void push_ready( block_matches&& b );
 
@@ -275,20 +278,32 @@ public:
   /// under _writer_mutex: operations are matched. Set at initialization by
   /// stinger-match-during-sync, otherwise by the end_of_syncing signal
   bool       _armed = false;
-  /// the lowest block whose operations were matched; 0 until there is
-  /// one. Usually the first matched block, but a fork that reaches below
-  /// it re-applies, and so matches, lower blocks. Written on the writer
-  /// thread, read by the sink for the hello record
-  std::atomic< uint32_t > _matching_from{ 0 };
+  /// For the hello record (records.hpp); written on the writer thread,
+  /// read by the sink, relaxed: the queue's mutex orders them against the
+  /// batches they describe.
+  /// The lowest block whose operations were matched; 0 until there is one.
+  /// Usually the first matched block, but a fork that reaches below it
+  /// re-applies, and so matches, lower blocks. One below it is the floor
+  /// of the irreversible stream's position: the blocks below were never
+  /// matched, so the stream never carries them
+  std::atomic< uint32_t > _matched_from{ 0 };
+  /// the highest block the chain has made irreversible. Stored before the
+  /// window's blocks up to it are released to the sink, so a hello that
+  /// reports it is never behind what the socket has delivered; it may run
+  /// ahead by the sink's backlog, which the contract allows. Monotonic: the
+  /// chain re-notifies heights after a fork switch driven by fast confirms
+  std::atomic< uint32_t > _last_irreversible_seen{ 0 };
   /// set by the sink thread if it exits on an exception: handlers stop
   /// producing for a sink that will never drain, and stop_sink() reports it
   std::atomic< bool >     _sink_failed{ false };
 
   /// sink-private: batches delivered, and per stream the last block it was
-  /// told about - a tripwire for the order each stream promises
-  uint64_t _batches_delivered          = 0;
-  uint32_t _last_irreversible_delivered = 0;
-  uint32_t _last_head_delivered         = 0;
+  /// told about - a tripwire for the order each stream promises, and for
+  /// the head stream its position, with the block's id, for the hello record
+  uint64_t                _batches_delivered           = 0;
+  uint32_t                _last_irreversible_delivered = 0;
+  uint32_t                _last_head_delivered         = 0;
+  protocol::block_id_type _last_head_delivered_id;
 
   /// sink-private: the socket, when stinger-socket is set; created in
   /// plugin_initialize before the sink thread starts and destroyed by
@@ -443,17 +458,19 @@ void stinger_plugin_impl::on_post_apply_block( const block_notification& note )
   {
     elog( "stinger: block ${b} sealed while blocks up to ${h} were announced and ${p} pending - the chain undid them silently; retracting",
       ("b", note.block_num)("h", _head.last_block())("p", _window.last_block()) );
-    retract_from( note.block_num );
+    retract_from( note.block_num, note.prev_block_id );
   }
 
   // The block's operations went through the matcher: validated, and the
-  // plugin armed. The lowest such block is what the hello record reports
+  // plugin armed. The lowest such block floors the position the hello
+  // reports; stored before the block's batch is pushed, so a hello that sees
+  // the batch sees it
   const bool matched = _armed && _db.is_validating_block();
   if( matched )
   {
-    const uint32_t lowest = _matching_from.load( std::memory_order_relaxed );
+    const uint32_t lowest = _matched_from.load( std::memory_order_relaxed );
     if( lowest == 0 || note.block_num < lowest )
-      _matching_from.store( note.block_num, std::memory_order_relaxed );
+      _matched_from.store( note.block_num, std::memory_order_relaxed );
   }
 
   // Head stream: the block's matches, if any, closed by block_applied, one
@@ -494,16 +511,16 @@ void stinger_plugin_impl::on_fail_apply_block( const block_notification& note )
   if( _head.last_block() >= note.block_num || _window.last_block() >= note.block_num )
   {
     wlog( "stinger: block ${b} rolled back after it was announced - retracting", ("b", note.block_num) );
-    retract_from( note.block_num );
+    retract_from( note.block_num, note.prev_block_id );
   }
 }
 
-void stinger_plugin_impl::retract_from( uint32_t block_num )
+void stinger_plugin_impl::retract_from( uint32_t block_num, const protocol::block_id_type& prev_id )
 {
   _window.drop_from( block_num );
   if( const auto below = _head.retract_from( block_num ) )
   {
-    _encoder->encode_switch_fork( *below );
+    _encoder->encode_switch_fork( *below, prev_id );
     push_ready( head_stream::marker( *below, _encoder->data(), _encoder->size() ) );
   }
 }
@@ -514,7 +531,12 @@ void stinger_plugin_impl::on_irreversible_block( uint32_t block_num )
   if( !scope )
     return;
 
-  // Irreversible stream: release every sealed block up to and including block_num
+  // Irreversible stream: release every sealed block up to and including
+  // block_num. The height goes to the sink first, so a hello written while
+  // the releases are still queued reports it (see _last_irreversible_seen);
+  // a re-notified lower height must not take it back
+  if( block_num > _last_irreversible_seen.load( std::memory_order_relaxed ) )
+    _last_irreversible_seen.store( block_num, std::memory_order_relaxed );
   _window.release_up_to( block_num, [this]( block_matches&& b ) { push_ready( std::move( b ) ); } );
 
   // Head stream: the consumer can drop its retraction state up to here
@@ -554,6 +576,20 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   const uint32_t held = _window.current().frames + _head.current().frames;
   _window.discard_current();
   _head.discard_current();
+
+  // The chain stands at the new head when it signals (sync_block_writer pops
+  // down to it first, startup undoes down to it), so the switch_fork marker
+  // names the head's id. Tripwire, before either stream is touched: a wrong
+  // id would send consumers after a block that is not there. A handler that
+  // bails here leaves both streams standing above the new head, and the
+  // next block sealed below them is retracted as a silent undo
+  // (on_post_apply_block); bailing after the window was cut and before the
+  // head stream was would instead leave the head stream unable to close
+  // any block until the chain passed its old height
+  const uint32_t chain_head = _db.head_block_num();
+  FC_ASSERT( chain_head == new_head_block_num,
+    "stinger: fork switch to block ${b} signalled with the chain at ${h}", ("b", new_head_block_num)("h", chain_head) );
+
   const auto dropped = _window.drop_from( new_head_block_num + 1 );
   if( dropped.blocks != 0 || held != 0 )
     dlog( "stinger: fork switch to block ${b} - ${k} block(s), ${n} match(es) dropped",
@@ -562,7 +598,7 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
   // Head stream: retract what it has seen above the new head, if anything
   if( const auto below = _head.switch_fork( new_head_block_num ) )
   {
-    _encoder->encode_switch_fork( *below );
+    _encoder->encode_switch_fork( *below, _db.head_block_id() );
     push_ready( head_stream::marker( *below, _encoder->data(), _encoder->size() ) );
   }
 }
@@ -635,7 +671,14 @@ void stinger_plugin_impl::sink_loop()
       }
       // before the batch, so a consumer that just connected gets it
       if( _socket )
-        _socket->poll( _records.hello( _matching_from.load( std::memory_order_relaxed ) ) );
+      {
+        stream_position position;
+        position.head_block = _last_head_delivered;
+        position.head_id    = _last_head_delivered_id;
+        position.irreversible = irreversible_position( _last_irreversible_seen.load( std::memory_order_relaxed ),
+                                                       _matched_from.load( std::memory_order_relaxed ) );
+        _socket->poll( _records.hello( position ) );
+      }
       if( !have )
         continue;
       // a decode tripwire or a sink bug drops this block, not hived: an
@@ -701,11 +744,12 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
         FC_ASSERT( b.cls == delivery_class::head, "stinger: block_applied frame in the irreversible stream" );
         uint32_t                block_num;
         protocol::block_id_type block_id;
-        decode_block_applied( f, block_num, block_id );
+        decode_block_with_id( f, block_num, block_id );
         // blocks are applied in order, and a switch_fork lowered the mark
         FC_ASSERT( block_num > _last_head_delivered,
           "stinger: head block ${b} delivered after block ${l}", ("b", block_num)("l", _last_head_delivered) );
-        _last_head_delivered = block_num;
+        _last_head_delivered    = block_num;
+        _last_head_delivered_id = block_id;
         dlog( "stinger: head block ${b} ${id} applied", ("b", block_num)("id", block_id) );
         if( _socket )
           _socket->send( _records.block_applied( block_num, block_id ) );
@@ -723,11 +767,14 @@ void stinger_plugin_impl::deliver_block( const block_matches& b )
       case frame_kind::switch_fork:
       {
         FC_ASSERT( b.cls == delivery_class::head, "stinger: switch_fork frame in the irreversible stream" );
-        const uint32_t new_head = decode_block_num( f );
+        uint32_t                new_head;
+        protocol::block_id_type new_head_id;
+        decode_block_with_id( f, new_head, new_head_id );
         ilog( "stinger: head blocks above ${b} retracted by a fork switch", ("b", new_head) );
-        _last_head_delivered = new_head;
+        _last_head_delivered    = new_head;
+        _last_head_delivered_id = new_head_id;
         if( _socket )
-          _socket->send( _records.switch_fork( new_head ) );
+          _socket->send( _records.switch_fork( new_head, new_head_id ) );
         break;
       }
       default:
@@ -835,7 +882,7 @@ void stinger_plugin_impl::stop_sink()
   {
     const auto& s = _socket->stats();
     ilog( "stinger: socket ${p} closed - ${a} connection(s) accepted, ${l} line(s) / ${b} byte(s) sent, ${r} record(s) rendered, ${c} closed by consumers, ${d} dropped behind, ${f} failed",
-      ("p", _socket->path().generic_string())("a", s.accepted)("l", s.lines)("b", s.bytes)("r", _records.next_seq() - 1)
+      ("p", _socket->path().generic_string())("a", s.accepted)("l", s.lines)("b", s.bytes)("r", _records.last_seq())
       ("c", s.closed_by_peer)("d", s.dropped_behind)("f", s.failed) );
     _socket.reset();
   }

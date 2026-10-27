@@ -89,9 +89,9 @@ using bounded_stream = fc::datastream< bounded_window >;
  * block's buffer holds that block's matches and nothing else, since the
  * block cannot be undone. Rules delivered at head also get the lifecycle
  * frames a consumer needs to retract: block_applied seals a block and names
- * its branch, switch_fork says everything above a height is gone, and
- * irreversible says everything up to a height is final and its retraction
- * state can go.
+ * its branch, switch_fork says everything above a height is gone and names
+ * the block now at that height, and irreversible says everything up to a
+ * height is final and its retraction state can go.
  *
  *   header (8 bytes)
  *     uint32 len             payload bytes following this header
@@ -109,11 +109,11 @@ using bounded_stream = fc::datastream< bounded_window >;
  *     uint64 rule_ids[rule_count]
  *     uint8  packed_op[]     fc::raw::pack of the operation; empty when body_omitted
  *
- *   block_applied payload (24 bytes)
+ *   block_applied / switch_fork payload (24 bytes)
  *     uint32 block_num
  *     uint8  block_id[20]    block_id_type (ripemd160)
  *
- *   irreversible / switch_fork payload (4 bytes)
+ *   irreversible payload (4 bytes)
  *     uint32 block_num
  *
  * One frame per matched operation however many rules matched it: the rule
@@ -237,10 +237,7 @@ public:
   /// a block_applied frame: the block's number and id
   void encode_block_applied( uint32_t block_num, const protocol::block_id_type& block_id )
   {
-    std::byte* p = _scratch.data() + sizeof( frame_header );
-    p = put( p, block_num );
-    p = put( p, block_id.data(), block_id.data_size() );
-    finish( frame_kind::block_applied, 0, 0, size_t( p - _scratch.data() ) - sizeof( frame_header ) );
+    encode_block_with_id( frame_kind::block_applied, block_num, block_id );
   }
 
   /// an irreversible frame: everything up to and including `block_num` is final
@@ -250,14 +247,22 @@ public:
     finish( frame_kind::irreversible, 0, 0, sizeof( block_num ) );
   }
 
-  /// a switch_fork frame: everything above `new_head_block_num` is discarded
-  void encode_switch_fork( uint32_t new_head_block_num )
+  /// a switch_fork frame: everything above `new_head_block_num` is discarded;
+  /// `new_head_id` is the block now at that height
+  void encode_switch_fork( uint32_t new_head_block_num, const protocol::block_id_type& new_head_id )
   {
-    put( _scratch.data() + sizeof( frame_header ), new_head_block_num );
-    finish( frame_kind::switch_fork, 0, 0, sizeof( new_head_block_num ) );
+    encode_block_with_id( frame_kind::switch_fork, new_head_block_num, new_head_id );
   }
 
 private:
+  void encode_block_with_id( frame_kind kind, uint32_t block_num, const protocol::block_id_type& block_id )
+  {
+    std::byte* p = _scratch.data() + sizeof( frame_header );
+    p = put( p, block_num );
+    p = put( p, block_id.data(), block_id.data_size() );
+    finish( kind, 0, 0, size_t( p - _scratch.data() ) - sizeof( frame_header ) );
+  }
+
   template< typename T >
   static std::byte* put( std::byte* p, const T& v )
   {
@@ -388,19 +393,21 @@ inline match_frame decode_match( const frame_view& f )
   return m;
 }
 
-/// decode a frame_kind::block_applied frame
-inline void decode_block_applied( const frame_view& f, uint32_t& block_num, protocol::block_id_type& block_id )
+/// decode a frame_kind::block_applied or frame_kind::switch_fork frame: a
+/// block number and the id of the block at that height
+inline void decode_block_with_id( const frame_view& f, uint32_t& block_num, protocol::block_id_type& block_id )
 {
-  FC_ASSERT( f.kind() == frame_kind::block_applied, "not a block_applied frame" );
-  FC_ASSERT( f.header.len == 4 + block_id.data_size(), "block_applied frame has ${n} payload bytes", ("n", f.header.len) );
+  FC_ASSERT( f.kind() == frame_kind::block_applied || f.kind() == frame_kind::switch_fork,
+             "frame kind ${k} carries no block id", ("k", f.header.kind) );
+  FC_ASSERT( f.header.len == 4 + block_id.data_size(), "block id frame has ${n} payload bytes", ("n", f.header.len) );
   std::memcpy( &block_num, f.payload, 4 );
   std::memcpy( block_id.data(), f.payload + 4, block_id.data_size() );
 }
 
-/// decode a frame_kind::irreversible or frame_kind::switch_fork frame
+/// decode a frame_kind::irreversible frame
 inline uint32_t decode_block_num( const frame_view& f )
 {
-  FC_ASSERT( f.kind() == frame_kind::irreversible || f.kind() == frame_kind::switch_fork,
+  FC_ASSERT( f.kind() == frame_kind::irreversible,
              "frame kind ${k} carries no bare block number", ("k", f.header.kind) );
   FC_ASSERT( f.header.len == 4, "block number frame has ${n} payload bytes", ("n", f.header.len) );
   uint32_t block_num;

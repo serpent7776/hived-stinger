@@ -6,8 +6,10 @@ import pytest
 
 import test_tools as tt
 from hive_local_tools.functional.stinger import (
+    Record,
     StreamReader,
     assert_well_formed,
+    delivered_head,
     enable_stinger,
     markers,
     matches,
@@ -129,14 +131,35 @@ def test_a_second_consumer_gets_the_same_stream(tmp_path: Path) -> None:
     second_records = second.records
     assert_well_formed(first_records)
     assert_well_formed(second_records)
-    # the late consumer's hello says where it joined, and from there both saw the same records
-    joined_at = second_records[0]["next_seq"]
+    # the late consumer's hello says where it joined: the first record it gets is the one above the hello's seq, and
+    # from there both saw the same records
+    joined_at = second_records[0]["seq"] + 1
     assert joined_at > 1
-    first_from_join = [r for r in first_records if "seq" in r and r["seq"] >= joined_at]
-    second_sequenced = [r for r in second_records if "seq" in r]
+    first_from_join = [r for r in first_records[1:] if r["seq"] >= joined_at]
+    second_sequenced = second_records[1:]
     common = min(len(first_from_join), len(second_sequenced))
     assert common > 0
     assert first_from_join[:common] == second_sequenced[:common]
+
+    # its hello names the head stream's position: the block the first consumer saw applied last before the join,
+    # and the next block_applied the late consumer gets is the one above it. The first consumer's reader thread may
+    # not have caught up to the join yet
+    head = second_records[0]["delivered"]["head"]
+    assert head is not None, "two blocks in and no head position"
+    first_records = first.wait_for(
+        lambda rs: any(r["seq"] == joined_at - 1 for r in rs[1:]), what="the first consumer's record before the join"
+    )
+    applied_before_join = [m for m in markers(first_records, "block_applied") if m["seq"] < joined_at]
+    assert applied_before_join, "the first consumer saw no block before the second joined"
+    assert head == {"block": applied_before_join[-1]["block"], "block_id": applied_before_join[-1]["block_id"]}
+    second_applied = markers(second_records, "block_applied")
+    assert second_applied, "the late consumer saw no block_applied"
+    assert second_applied[0]["block"] == head["block"] + 1
+    # and the irreversible stream's position is a height the chain had made irreversible by then, or one below the
+    # first matched block if that is higher; the stream has started, so it is not null
+    irreversible = second_records[0]["delivered"]["irreversible"]
+    assert irreversible is not None, "two blocks in and the irreversible stream has not started"
+    assert 0 <= irreversible <= max(node.get_last_irreversible_block_number(), head["block"]), second_records[0]
 
 
 # the chain plugin calls a node live once its head block is within a minute of now; a joiner has to sync at least
@@ -144,11 +167,12 @@ def test_a_second_consumer_gets_the_same_stream(tmp_path: Path) -> None:
 BLOCKS_OLDER_THAN_LIVE_SYNC_GAP = 25
 
 
-def _join_an_old_chain(tmp_path: Path, *, match_during_sync: bool) -> tuple[tt.ApiNode, StreamReader, int, int]:
+def _join_an_old_chain(tmp_path: Path, *, match_during_sync: bool) -> tuple[tt.ApiNode, StreamReader, int, int, Record]:
     """
     A producer makes a chain older than the live-sync gap, then a stinger node joins and syncs it. Returns the joiner,
-    a consumer connected before the joiner went live, the producer's head once the joiner was live, and
-    `matching_from` as a consumer connecting after the joiner is live sees it.
+    a consumer connected before the joiner went live, the producer's head once the joiner was live, the head position
+    that consumer's hello reported (0 if it was there before any block was delivered), and the hello a consumer
+    connecting after the joiner is live gets.
     """
     producer = tt.InitNode()
     joiner = tt.ApiNode()
@@ -165,40 +189,63 @@ def _join_an_old_chain(tmp_path: Path, *, match_during_sync: bool) -> tuple[tt.A
     # the joiner went live after a sync batch ending at or below this height
     head_when_live = producer.get_last_block_number()
     joiner.wait_number_of_blocks(2)
+    records = early.wait_for(lambda rs: len(markers(rs, "block_applied")) >= 2, what="two blocks at head")
+    early_head = delivered_head(records[0])
+
+    # a consumer connecting now is told where the head stream stands: a block the early one has seen applied, and
+    # the next block it gets is the one above
     late = StreamReader(socket_path)
-    late_hello = late.wait_for(lambda rs: bool(rs), what="the late consumer's hello")[0]
+    late_records = late.wait_for(lambda rs: bool(markers(rs, "block_applied")), what="the late consumer's first block")
     late.close()
-    assert late_hello["kind"] == "hello"
-    assert late_hello["matching_from"] is not None, "live for two blocks and still nothing matched"
-    return joiner, early, head_when_live, late_hello["matching_from"]
+    assert_well_formed(late_records)
+    late_head = late_records[0]["delivered"]["head"]
+    assert late_head is not None, "live for two blocks and no head position"
+    # delivered to the early consumer before the late one was greeted; its reader thread may still be behind
+    early_records = early.wait_for(
+        lambda rs: any(m["block"] == late_head["block"] for m in markers(rs, "block_applied")),
+        what="the early consumer's copy of the late hello's head block",
+    )
+    seen_by_early = {m["block"]: m["block_id"] for m in markers(early_records, "block_applied")}
+    assert seen_by_early[late_head["block"]] == late_head["block_id"], (late_head, seen_by_early)
+    assert markers(late_records, "block_applied")[0]["block"] == late_head["block"] + 1
+    late_hello = late_records[0]
+    assert late_hello["delivered"]["irreversible"] is not None, "live for two blocks and nothing matched"
+    return joiner, early, head_when_live, early_head, late_hello
 
 
-def _applied_blocks_are_contiguous_from(records: list[dict], matching_from: int) -> None:
+def _applied_blocks_are_contiguous_from(records: list[dict], first: int) -> None:
     applied = [m["block"] for m in markers(records, "block_applied")]
     assert applied, "no block_applied markers"
     assert applied == list(range(applied[0], applied[0] + len(applied))), f"block_applied not contiguous: {applied}"
-    if records[0]["matching_from"] is None:
-        # this consumer was there before the first matched block, so it saw it
-        assert applied[0] == matching_from, f"first block_applied {applied[0]} but matching_from {matching_from}"
-    else:
-        assert applied[0] >= matching_from
+    assert applied[0] == first, f"first block_applied {applied[0]}, expected {first}"
 
 
 @pytest.mark.testnet
 def test_matching_starts_when_the_node_is_live(tmp_path: Path) -> None:
     """
-    By default a joining node syncs the old blocks with matching off and arms the matcher when it goes live: hello
-    says where, every block from there on is reported, nothing below it ever is.
+    By default a joining node syncs the old blocks with matching off and arms the matcher when it goes live: every
+    block from there on is reported, nothing below it ever is.
     """
-    joiner, early, head_when_live, matching_from = _join_an_old_chain(tmp_path, match_during_sync=False)
+    joiner, early, head_when_live, early_head, late_hello = _join_an_old_chain(tmp_path, match_during_sync=False)
     records = early.wait_for(lambda rs: len(markers(rs, "block_applied")) >= 2, what="two blocks at head")
     assert_well_formed(records)
+    # the consumer connected while the joiner was syncing with matching off, so nothing had been delivered: it saw
+    # the first matched block itself
+    assert early_head == 0, f"blocks were delivered before the joiner was live, up to {early_head}"
+    matched_from = markers(records, "block_applied")[0]["block"]
     # the gate held through the blocks older than the gap, and opened with the first block after the sync batch that
     # made the joiner live - not some later one
-    assert matching_from > 1, "the synced blocks were matched"
-    assert matching_from <= head_when_live + 1, f"matching only started at {matching_from}, live by {head_when_live}"
-    _applied_blocks_are_contiguous_from(records, matching_from)
-    assert all(m["block"] >= matching_from for m in matches(records))
+    assert matched_from > 1, "the synced blocks were matched"
+    assert matched_from <= head_when_live + 1, f"matching only started at {matched_from}, live by {head_when_live}"
+    _applied_blocks_are_contiguous_from(records, matched_from)
+    assert all(m["block"] >= matched_from for m in matches(records))
+    # the irreversible stream's position covers the synced blocks the node never matched: a consumer backfills up to
+    # it, and the stream carries everything above. The early consumer's hello may already say so: the lowest matched
+    # block is stored before the block's batch is pushed, and the sink greets before it delivers
+    bound = max(joiner.get_last_irreversible_block_number(), matched_from - 1)
+    assert matched_from - 1 <= late_hello["delivered"]["irreversible"] <= bound, late_hello
+    early_irreversible = records[0]["delivered"]["irreversible"]
+    assert early_irreversible is None or matched_from - 1 <= early_irreversible <= bound, records[0]
     joiner.close()
     assert_well_formed(early.wait_for_eof())
 
@@ -206,12 +253,17 @@ def test_matching_starts_when_the_node_is_live(tmp_path: Path) -> None:
 @pytest.mark.testnet
 def test_match_during_sync_backfills_the_synced_blocks(tmp_path: Path) -> None:
     """With stinger-match-during-sync the synced blocks are matched too: the stream starts at block 1."""
-    joiner, early, _, matching_from = _join_an_old_chain(tmp_path, match_during_sync=True)
+    joiner, early, head_when_live, early_head, late_hello = _join_an_old_chain(tmp_path, match_during_sync=True)
     records = early.wait_for(lambda rs: len(markers(rs, "block_applied")) >= 2, what="two blocks at head")
     assert_well_formed(records)
-    assert matching_from == 1
-    _applied_blocks_are_contiguous_from(records, matching_from)
-    if records[0]["matching_from"] is None:
+    # every block was matched, so the irreversible stream's position is the chain's own: nothing to skip below it
+    assert 0 <= late_hello["delivered"]["irreversible"] <= joiner.get_last_irreversible_block_number(), late_hello
+    # the joiner syncs fast, so the consumer may have missed delivered blocks; the hello says how many, and the stream
+    # takes over exactly there
+    _applied_blocks_are_contiguous_from(records, early_head + 1)
+    if early_head == 0:
         assert any(m["block"] == 1 for m in matches(records)), "block 1 has virtual operations and none matched"
+    else:
+        assert early_head < head_when_live, f"the blocks delivered before the consumer connected reach {early_head}"
     joiner.close()
     assert_well_formed(early.wait_for_eof())

@@ -25,11 +25,19 @@ record_writer::record_writer( size_t line_limit )
   FC_ASSERT( line_limit > 0, "the line limit must be positive" );
 }
 
-const std::string& record_writer::hello( uint32_t matching_from )
+const std::string& record_writer::hello( const stream_position& position )
 {
+  // a stream that has not started stands nowhere: null
+  fc::variant head;
+  if( position.head_block != 0 )
+    head = fc::variant( fc::mutable_variant_object()( "block", position.head_block )( "block_id", position.head_id ) );
+  fc::variant irreversible;
+  if( position.irreversible )
+    irreversible = fc::variant( *position.irreversible );
+
   fc::mutable_variant_object obj;
-  obj( "kind", "hello" )( "version", FORMAT_VERSION )( "next_seq", _next_seq )
-     ( "matching_from", matching_from != 0 ? fc::variant( matching_from ) : fc::variant() );
+  obj( "kind", "hello" )( "seq", last_seq() )( "version", FORMAT_VERSION )
+     ( "delivered", fc::mutable_variant_object()( "head", std::move( head ) )( "irreversible", std::move( irreversible ) ) );
   render( obj, _line );
   return _line;
 }
@@ -89,9 +97,9 @@ const std::string& record_writer::irreversible( uint32_t block_num )
   return marker( "irreversible", block_num, nullptr );
 }
 
-const std::string& record_writer::switch_fork( uint32_t block_num )
+const std::string& record_writer::switch_fork( uint32_t block_num, const protocol::block_id_type& block_id )
 {
-  return marker( "switch_fork", block_num, nullptr );
+  return marker( "switch_fork", block_num, &block_id );
 }
 
 const std::string& record_writer::marker( const char* kind, uint32_t block_num, const protocol::block_id_type* block_id )

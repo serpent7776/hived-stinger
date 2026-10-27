@@ -119,6 +119,11 @@ def test_head_stream_retracts_a_lost_fork(tmp_path: Path) -> None:
     retraction = retractions[0]
     assert split_at - 1 <= retraction["block"] < min(own_heights), retraction
     assert all(retraction["seq"] > m["seq"] for m in own_blocks)
+    # it names the block at the common height: the one announced there before the retraction
+    announced_ids = {
+        m["block"]: m["block_id"] for m in markers(records, "block_applied") if m["seq"] < retraction["seq"]
+    }
+    assert retraction["block_id"] == announced_ids[retraction["block"]], retraction
 
     # every retracted height was announced again afterwards, as a different block
     announced_after = {m["block"]: m for m in markers(records, "block_applied") if m["seq"] > retraction["seq"]}

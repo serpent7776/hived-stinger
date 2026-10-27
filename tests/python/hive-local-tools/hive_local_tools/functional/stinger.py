@@ -162,26 +162,54 @@ def markers(records: Iterable[Record], kind: str) -> list[Record]:
     return [r for r in records if r["kind"] == kind]
 
 
+def delivered_head(hello: Record) -> int:
+    """The head stream's position a hello reports: the last block delivered at head, 0 for none."""
+    head = hello["delivered"]["head"]
+    return 0 if head is None else head["block"]
+
+
+def _assert_hello_well_formed(hello: Record) -> None:
+    assert hello["kind"] == "hello", f"first record is {hello}"
+    assert hello["version"] == 1
+    assert isinstance(hello["seq"], int), hello
+    assert hello["seq"] >= 0, hello
+    delivered = hello["delivered"]
+    assert set(delivered) == {"head", "irreversible"}, hello
+    head = delivered["head"]
+    if head is not None:
+        assert set(head) == {"block", "block_id"}, hello
+        assert isinstance(head["block"], int), hello
+        assert head["block"] >= 1, hello
+        assert isinstance(head["block_id"], str), hello
+        assert len(head["block_id"]) == 40, hello
+    # null while the irreversible stream has not started; 0 once it has and nothing is irreversible yet
+    irreversible = delivered["irreversible"]
+    assert irreversible is None or (isinstance(irreversible, int) and irreversible >= 0), hello
+
+
+def _assert_head_position_is_a_cut(hello: Record, sequenced: list[Record]) -> None:
+    """Every head record after the hello is above its head position, and above every switch_fork since."""
+    floor = delivered_head(hello)
+    for r in sequenced:
+        if r["kind"] == "switch_fork":
+            assert len(r["block_id"]) == 40, r
+            floor = r["block"]
+        elif r["kind"] == "block_applied" or (r["kind"] == "match" and r["delivery"] == "head"):
+            assert r["block"] > floor, f"{r} is at or below the head position {floor}"
+
+
 def assert_well_formed(records: list[Record]) -> None:
-    """The invariants every stream must hold: hello first, then seq contiguous, every record with a kind."""
+    """The invariants every stream must hold: hello first, then seq contiguous from it, every record with a kind."""
     assert records, "no records at all"
-    assert records[0]["kind"] == "hello", f"first record is {records[0]}"
-    assert records[0]["version"] == 1
-    matching_from = records[0]["matching_from"]
-    assert matching_from is None or (isinstance(matching_from, int) and matching_from >= 1), records[0]
-    sequenced = [r for r in records if "seq" in r]
-    expected = records[0]["next_seq"]
+    hello = records[0]
+    _assert_hello_well_formed(hello)
+    # the hello stands at the last record rendered before the connection; what follows counts up from there
+    sequenced = records[1:]
+    expected = hello["seq"] + 1
     for r in sequenced:
         assert r["seq"] == expected, f"seq gap: expected {expected}, got {r}"
         expected += 1
     for r in sequenced:
         assert r["kind"] in {"match", "block_applied", "irreversible", "switch_fork"}, r
-    # nothing below the lowest matched block is reported, unless a fork reached below it: then the chain re-applied,
-    # and the node matched, blocks below it, announced after the switch_fork that retracted the others
-    if matching_from is not None:
-        floor = matching_from
-        for r in sequenced:
-            if r["kind"] == "switch_fork" and r["block"] < floor:
-                floor = r["block"] + 1
-            elif r["kind"] in {"match", "block_applied"}:
-                assert r["block"] >= floor, f"{r} is below matching_from={matching_from} (floor {floor})"
+    # irreversible matches may trail below the hello's irreversible bound; nothing is promised about them
+    _assert_head_position_is_a_cut(hello, sequenced)

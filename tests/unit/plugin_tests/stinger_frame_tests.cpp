@@ -175,22 +175,23 @@ BOOST_AUTO_TEST_CASE( lifecycle_frames_round_trip )
 {
   frame_encoder enc( TEST_BUDGET );
   const block_id_type block_id = fc::ripemd160::hash( std::string( "block" ) );
+  const block_id_type fork_id  = fc::ripemd160::hash( std::string( "common" ) );
 
   std::vector< std::byte > buf;
   enc.encode_block_applied( 1000, block_id );
   append( buf, enc );
   enc.encode_irreversible( 980 );
   append( buf, enc );
-  enc.encode_switch_fork( 995 );
+  enc.encode_switch_fork( 995, fork_id );
   append( buf, enc );
-  BOOST_CHECK_EQUAL( buf.size(), 3 * sizeof( frame_header ) + 24 + 4 + 4 );
+  BOOST_CHECK_EQUAL( buf.size(), 3 * sizeof( frame_header ) + 24 + 4 + 24 );
 
   frame_reader reader( buf.data(), buf.size() );
   frame_view f = reader.next();
   BOOST_CHECK( f.kind() == frame_kind::block_applied );
   uint32_t      num;
   block_id_type id;
-  decode_block_applied( f, num, id );
+  decode_block_with_id( f, num, id );
   BOOST_CHECK_EQUAL( num, 1000u );
   BOOST_CHECK( id == block_id );
   BOOST_CHECK_THROW( decode_match( f ), fc::exception );
@@ -199,11 +200,14 @@ BOOST_AUTO_TEST_CASE( lifecycle_frames_round_trip )
   f = reader.next();
   BOOST_CHECK( f.kind() == frame_kind::irreversible );
   BOOST_CHECK_EQUAL( decode_block_num( f ), 980u );
-  BOOST_CHECK_THROW( decode_block_applied( f, num, id ), fc::exception );
+  BOOST_CHECK_THROW( decode_block_with_id( f, num, id ), fc::exception );
 
   f = reader.next();
   BOOST_CHECK( f.kind() == frame_kind::switch_fork );
-  BOOST_CHECK_EQUAL( decode_block_num( f ), 995u );
+  decode_block_with_id( f, num, id );
+  BOOST_CHECK_EQUAL( num, 995u );
+  BOOST_CHECK( id == fork_id );
+  BOOST_CHECK_THROW( decode_block_num( f ), fc::exception );
 
   BOOST_CHECK( !reader.more() );
   BOOST_CHECK_THROW( reader.next(), fc::exception );
