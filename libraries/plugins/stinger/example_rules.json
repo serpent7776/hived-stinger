@@ -7,8 +7,13 @@
     },
     {
       "name": "alice-activity",
-      "match": "\"alice\" in impacted_accounts",
+      "match": "\"alice\" in impacted_accounts and not is_virtual",
       "exec": { "type": "log" }
+    },
+    {
+      "name": "shop-paid",
+      "match": "op_type in (transfer, fill_recurrent_transfer) and to = \"shop\"",
+      "exec": { "type": "socket" }
     },
     {
       "name": "splinterlands-market",

@@ -35,6 +35,11 @@ def test_matches_reach_a_socket_consumer(tmp_path: Path) -> None:
             rule("follow-json", 'op_type = 18 and custom_id = "follow"', delivery="head"),
             # head: anything touching alice, so the same operations show up under two rules
             rule("alice-head", '"alice" in impacted_accounts', delivery="head"),
+            # irreversible: the op's own `to` field, which impacted_accounts cannot tell from `from`
+            rule("alice-paid", 'to = "alice"'),
+            # head: the virtual flag, bare in the grammar, in both polarities
+            rule("alice-real", 'not is_virtual and "alice" in impacted_accounts', delivery="head"),
+            rule("block-rewards", "is_virtual and op_type = producer_reward", delivery="head"),
             # a log rule must never appear on the socket
             rule("everything-log", "op_type >= 0", exec_type="log"),
         ],
@@ -58,14 +63,14 @@ def test_matches_reach_a_socket_consumer(tmp_path: Path) -> None:
     assert head_follow["op"]["value"]["required_posting_auths"] == ["alice"]
     assert head_follow["trx_id"] == follow.transaction_id
     assert head_follow["virtual_op"] is False
-    # alice is impacted by it too, and both head rules are named on the one record
-    assert sorted(head_follow["rules"]) == ["alice-head", "follow-json"]
+    # alice is impacted by it too, and the head rules it matched are named on the one record
+    assert sorted(head_follow["rules"]) == ["alice-head", "alice-real", "follow-json"]
 
     # the transfer at head is alice's business only; big-transfer is an irreversible rule
     head_transfer = next(
         m for m in matches(records, delivery="head", rule_name="alice-head") if m["trx_id"] == transfer.transaction_id
     )
-    assert head_transfer["rules"] == ["alice-head"]
+    assert sorted(head_transfer["rules"]) == ["alice-head", "alice-real"]
     assert head_transfer["op"]["type"] == "transfer_operation"
     assert head_transfer["op"]["value"]["from"] == "initminer"
     assert head_transfer["op"]["value"]["to"] == "alice"
@@ -86,7 +91,7 @@ def test_matches_reach_a_socket_consumer(tmp_path: Path) -> None:
         what="the transfer at irreversibility",
     )
     irreversible_transfer = matches(records, delivery="irreversible", rule_name="big-transfer")[0]
-    assert irreversible_transfer["rules"] == ["big-transfer"]
+    assert sorted(irreversible_transfer["rules"]) == ["alice-paid", "big-transfer"]
     assert irreversible_transfer["trx_id"] == transfer.transaction_id
     assert irreversible_transfer["block"] == transfer.block_num
     assert irreversible_transfer["trx_in_block"] == head_transfer["trx_in_block"]
@@ -101,13 +106,28 @@ def test_matches_reach_a_socket_consumer(tmp_path: Path) -> None:
 
     # the 10 TESTS from create_account are under the big-transfer threshold; the 100 TESTS are the only hit
     assert len(matches(records, rule_name="big-transfer")) == 1
+    # `to` is alice on every op naming her as receiver and nothing else: create_account's 10 TESTS transfer and
+    # 100 TESTS power-up, then the 100 TESTS transfer; the op's own field, so the power-up counts and the follow does not
+    paid = matches(records, rule_name="alice-paid")
+    assert sorted((m["op"]["type"], m["op"]["value"]["amount"]["amount"]) for m in paid) == [
+        ("transfer_operation", "10000"),
+        ("transfer_operation", "100000"),
+        ("transfer_to_vesting_operation", "100000"),
+    ], paid
+    assert all(m["op"]["value"]["to"] == "alice" for m in paid)
+    # `is_virtual` in both polarities: no virtual op under alice-real, only virtual ones under block-rewards
+    assert matches(records, rule_name="alice-real")
+    assert all(m["virtual_op"] is False for m in matches(records, rule_name="alice-real"))
+    rewards = matches(records, rule_name="block-rewards")
+    assert rewards
+    assert all(m["virtual_op"] is True and m["op"]["type"] == "producer_reward_operation" for m in rewards)
     # nothing a log rule matched leaks onto the socket
     assert all("everything-log" not in m["rules"] for m in matches(records))
     # every socket record names only socket rules of its own class
     for m in matches(records, delivery="irreversible"):
-        assert set(m["rules"]) <= {"big-transfer"}, m
+        assert set(m["rules"]) <= {"big-transfer", "alice-paid"}, m
     for m in matches(records, delivery="head"):
-        assert set(m["rules"]) <= {"follow-json", "alice-head"}, m
+        assert set(m["rules"]) <= {"follow-json", "alice-head", "alice-real", "block-rewards"}, m
     assert_well_formed(records)
 
     # the node's shutdown ends the stream cleanly; the consumer sees EOF after the last complete line

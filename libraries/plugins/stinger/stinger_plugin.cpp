@@ -54,6 +54,9 @@ constexpr const char* STINGER_ATTR_IMPACTED_ACCOUNTS = "impacted_accounts";
 constexpr const char* STINGER_ATTR_AMOUNT            = "amount";
 constexpr const char* STINGER_ATTR_SYMBOL            = "symbol";
 constexpr const char* STINGER_ATTR_CUSTOM_ID         = "custom_id";
+constexpr const char* STINGER_ATTR_FROM              = "from";
+constexpr const char* STINGER_ATTR_TO                = "to";
+constexpr const char* STINGER_ATTR_IS_VIRTUAL        = "is_virtual";
 
 /// The largest match frame the encoder builds: the block size ceiling, which
 /// bounds any operation in a block, plus the overhead of a frame carrying as
@@ -97,21 +100,50 @@ struct event_slots
   size_t amount;
   size_t symbol;
   size_t custom_id;
+  size_t from;
+  size_t to;
+  size_t is_virtual;
 };
 
+/// true when Op has a member `amount` of type asset
 template< typename Op, typename = void >
 struct has_asset_amount : std::false_type {};
 template< typename Op >
 struct has_asset_amount< Op,
   std::enable_if_t< std::is_same_v< decltype( Op::amount ), protocol::asset > > > : std::true_type {};
 
-/// pulls the per-op-type event attributes out of an operation
+/// true when Op has a member `from` of type account_name_type
+template< typename Op, typename = void >
+struct has_account_from : std::false_type {};
+template< typename Op >
+struct has_account_from< Op,
+  std::enable_if_t< std::is_same_v< decltype( Op::from ), protocol::account_name_type > > > : std::true_type {};
+
+/// true when Op has a member `to` of type account_name_type
+template< typename Op, typename = void >
+struct has_account_to : std::false_type {};
+template< typename Op >
+struct has_account_to< Op,
+  std::enable_if_t< std::is_same_v< decltype( Op::to ), protocol::account_name_type > > > : std::true_type {};
+
+/**
+ * Pulls the per-op-type event attributes out of an operation. Each is the
+ * operation's own field of that name, found by type: `amount` is the asset
+ * member called amount (the transfer family and the two convert ops - an op
+ * whose assets go by other names, fill_order's current_pays or
+ * author_reward's hbd_payout, has no amount or symbol), `from` and `to` are
+ * the account members called that (transfers, savings, escrows, recurrent
+ * transfers and their virtual fills). An empty name is left undefined: it is
+ * not an account (transfer_to_vesting leaves `to` empty to mean `from`).
+ */
 struct event_attribute_visitor
 {
   typedef void result_type;
 
   std::optional< protocol::asset >& amount;
   std::optional< std::string >&     custom_id;
+  std::optional< std::string >&     from;
+  std::optional< std::string >&     to;
 
   void operator()( const protocol::custom_json_operation& op ) const
   {
@@ -123,6 +155,12 @@ struct event_attribute_visitor
   {
     if constexpr( has_asset_amount< Op >::value )
       amount = op.amount;
+    if constexpr( has_account_from< Op >::value )
+      if( op.from.size() )
+        from = std::string( op.from );
+    if constexpr( has_account_to< Op >::value )
+      if( op.to.size() )
+        to = std::string( op.to );
   }
 };
 
@@ -365,7 +403,9 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
 
   std::optional< protocol::asset > amount;
   std::optional< std::string >     custom_id;
-  note.op.visit( event_attribute_visitor{ amount, custom_id } );
+  std::optional< std::string >     from;
+  std::optional< std::string >     to;
+  note.op.visit( event_attribute_visitor{ amount, custom_id, from, to } );
 
   fc::flat_set< protocol::account_name_type > impacted;
   app::operation_get_impacted_accounts( note.op, impacted );
@@ -376,6 +416,8 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
 
   betree_set_variable( event.get(), _slots.op_type,
     betree_make_integer_variable( STINGER_ATTR_OP_TYPE, note.op.which() ) );
+  betree_set_variable( event.get(), _slots.is_virtual,
+    betree_make_boolean_variable( STINGER_ATTR_IS_VIRTUAL, note.virtual_op ) );
 
   // owned here until it is attached to the event, which frees it with the
   // event; a throw in the loop must not leak it
@@ -399,6 +441,13 @@ void stinger_plugin_impl::on_post_apply_operation( const operation_notification&
   if( custom_id )
     betree_set_variable( event.get(), _slots.custom_id,
       betree_make_string_variable( STINGER_ATTR_CUSTOM_ID, custom_id->c_str() ) );
+
+  if( from )
+    betree_set_variable( event.get(), _slots.from,
+      betree_make_string_variable( STINGER_ATTR_FROM, from->c_str() ) );
+  if( to )
+    betree_set_variable( event.get(), _slots.to,
+      betree_make_string_variable( STINGER_ATTR_TO, to->c_str() ) );
 
   std::unique_ptr< report, decltype( &free_report ) > matches( make_report(), &free_report );
   FC_ASSERT( matches, "stinger: failed to create be-tree report" );
@@ -894,7 +943,8 @@ event_slots declare_rule_attributes( betree* tree )
   // an attribute is an identifier in the match expression, where an
   // operation name is rewritten to its number: the vocabularies must not meet
   for( const char* attr : { STINGER_ATTR_OP_TYPE, STINGER_ATTR_IMPACTED_ACCOUNTS, STINGER_ATTR_AMOUNT,
-                            STINGER_ATTR_SYMBOL, STINGER_ATTR_CUSTOM_ID } )
+                            STINGER_ATTR_SYMBOL, STINGER_ATTR_CUSTOM_ID, STINGER_ATTR_FROM, STINGER_ATTR_TO,
+                            STINGER_ATTR_IS_VIRTUAL } )
     FC_ASSERT( resolve_operation_names( attr ) == attr,
       "stinger: attribute \"${a}\" is also an operation name", ("a", attr) );
 
@@ -902,14 +952,22 @@ event_slots declare_rule_attributes( betree* tree )
 
   // op.which() over hive::protocol::operation (virtual ops included)
   slots.op_type = betree_add_integer_variable( tree, STINGER_ATTR_OP_TYPE, false, 0, hive::protocol::operation::count() - 1 );
+  // whether the op is virtual (operation_notification::virtual_op); a rule
+  // tests it bare: `is_virtual`, `not is_virtual`
+  slots.is_virtual = betree_add_boolean_variable( tree, STINGER_ATTR_IS_VIRTUAL, false );
   // operation_get_impacted_accounts of the op
   slots.impacted_accounts = betree_add_string_list_variable( tree, STINGER_ATTR_IMPACTED_ACCOUNTS, false, SIZE_MAX );
-  // primary asset of ops that carry one: amount in satoshis + symbol name;
-  // undefined for ops without an asset
+  // the op's own `amount` field (event_attribute_visitor): satoshis and the
+  // symbol name; undefined for ops without a field of that name, which
+  // includes ops whose assets go by other names
   slots.amount = betree_add_integer_variable( tree, STINGER_ATTR_AMOUNT, true, 0, INT64_MAX );
   slots.symbol = betree_add_string_variable( tree, STINGER_ATTR_SYMBOL, true, SIZE_MAX );
   // custom_json_operation id; undefined for other op types
   slots.custom_id = betree_add_string_variable( tree, STINGER_ATTR_CUSTOM_ID, true, SIZE_MAX );
+  // the op's own `from` / `to` account fields (event_attribute_visitor);
+  // undefined for ops without them or when the field is empty
+  slots.from = betree_add_string_variable( tree, STINGER_ATTR_FROM, true, SIZE_MAX );
+  slots.to   = betree_add_string_variable( tree, STINGER_ATTR_TO, true, SIZE_MAX );
 
   return slots;
 }
