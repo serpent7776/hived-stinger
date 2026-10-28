@@ -2,6 +2,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <hive/plugins/stinger/rules.hpp>
+#include <hive/protocol/operations.hpp>
 
 #include <fc/crypto/city.hpp>
 #include <fc/exception/exception.hpp>
@@ -12,6 +13,7 @@
 
 using hive::plugins::stinger::exec_type;
 using hive::plugins::stinger::load_rules_file;
+using hive::plugins::stinger::resolve_operation_names;
 using hive::plugins::stinger::rules_config;
 
 namespace {
@@ -49,6 +51,8 @@ BOOST_AUTO_TEST_CASE( valid_rules_file )
   BOOST_CHECK_EQUAL( config.rules[0].id, fc::city_hash64( name.data(), name.size() ) );
   BOOST_CHECK_EQUAL( config.rules[0].name, name );
   BOOST_CHECK_EQUAL( config.rules[0].match, "op_type = 2 and amount > 1000000" );
+  // nothing to resolve: the compiled expression is the match as written
+  BOOST_CHECK_EQUAL( config.rules[0].expr, config.rules[0].match );
   BOOST_CHECK( config.rules[0].exec.type == exec_type::log );
   BOOST_CHECK_EQUAL( config.rules[1].name, "sl-market" );
   BOOST_CHECK( config.rules[1].exec.type == exec_type::log );
@@ -118,6 +122,54 @@ BOOST_AUTO_TEST_CASE( explicit_id_is_rejected )
   fc::temp_directory dir;
   BOOST_REQUIRE_THROW( load_from_text( dir,
     R"( { "rules": [ { "id": 1, "name": "r", "match": "op_type = 2", "exec": { "type": "log" } } ] } )" ), fc::exception );
+}
+
+BOOST_AUTO_TEST_CASE( operation_names )
+{
+  // an operation may be named as database_api prints it, or without the
+  // suffix; either becomes its index in hive::protocol::operation
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = transfer_operation" ), "op_type = 2" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = transfer" ), "op_type = 2" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = custom_json" ), "op_type = 18" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type in (transfer, escrow_transfer_operation)" ), "op_type in (2, 27)" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "transfer = op_type" ), "2 = op_type" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type<>transfer and amount>1" ), "op_type<>2 and amount>1" );
+  // virtual operations too
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = fill_recurrent_transfer" ),
+    "op_type = " + std::to_string( hive::protocol::operation::tag< hive::protocol::fill_recurrent_transfer_operation >::value ) );
+  // a name inside a string literal is data, in either quote and past an escape
+  BOOST_CHECK_EQUAL( resolve_operation_names( "custom_id = \"transfer\"" ), "custom_id = \"transfer\"" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "custom_id = 'transfer'" ), "custom_id = 'transfer'" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "custom_id = \"a\\\"transfer\" and op_type = transfer" ),
+    "custom_id = \"a\\\"transfer\" and op_type = 2" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "custom_id = \"transfer" ), "custom_id = \"transfer" );
+  // an identifier is the be-tree's [a-zA-Z_][a-zA-Z0-9_-]*: a name that is
+  // part of a longer identifier, or that names nothing, is left for the parser
+  BOOST_CHECK_EQUAL( resolve_operation_names( "transfer_ = 1" ), "transfer_ = 1" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "transfer-1 = 1" ), "transfer-1 = 1" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "_transfer = 1" ), "_transfer = 1" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = transfr" ), "op_type = transfr" );
+  // a number next to the resolved one stays a separate token, so what the
+  // be-tree lexer rejected as written it still rejects
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = 2transfer" ), "op_type = 2 2" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = transfer.5" ), "op_type = 2 .5" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = 1.5transfer." ), "op_type = 1.5 2 ." );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "op_type = 2" ), "op_type = 2" );
+  BOOST_CHECK_EQUAL( resolve_operation_names( "" ), "" );
+
+  // and the loader stores the resolved expression next to the match as written
+  fc::temp_directory dir;
+  rules_config config = load_from_text( dir, R"(
+    { "rules": [
+      { "name": "named", "match": "op_type = transfer and amount > 10", "exec": { "type": "log" } },
+      { "name": "numbered", "match": "op_type = 2 and amount > 10", "exec": { "type": "log" } } ] } )" );
+  BOOST_REQUIRE_EQUAL( config.rules.size(), 2u );
+  BOOST_CHECK_EQUAL( config.rules[0].match, "op_type = transfer and amount > 10" );
+  BOOST_CHECK_EQUAL( config.rules[0].expr, "op_type = 2 and amount > 10" );
+  BOOST_CHECK_EQUAL( config.rules[1].expr, config.rules[0].expr );
+  // the resolved expression is derived, not part of the file format
+  BOOST_REQUIRE_THROW( load_from_text( dir,
+    R"( { "rules": [ { "name": "r", "match": "op_type = transfer", "expr": "op_type = 2", "exec": { "type": "log" } } ] } )" ), fc::exception );
 }
 
 BOOST_AUTO_TEST_CASE( exec_types )

@@ -1,12 +1,14 @@
 #include <hive/plugins/stinger/rules.hpp>
 
+#include <hive/protocol/operations.hpp>
+
 #include <fc/crypto/city.hpp>
 #include <fc/exception/exception.hpp>
 #include <fc/io/json.hpp>
 #include <fc/reflect/variant.hpp>
 
+#include <algorithm>
 #include <map>
-
 #include <set>
 #include <string>
 
@@ -59,7 +61,95 @@ void check_rule_object( const fc::variant& var, size_t index )
   }
 }
 
+struct operation_type_name
+{
+  std::string& name;
+  explicit operation_type_name( std::string& n ) : name( n ) {}
+  typedef void result_type;
+  template< typename T > void operator()( const T& ) const { name = fc::get_typename< T >::name(); }
+};
+
+/// operation name (with and without the `_operation` suffix) -> op.which()
+const std::map< std::string, int64_t >& operation_type_ids()
+{
+  static const std::map< std::string, int64_t > ids = []()
+  {
+    std::map< std::string, int64_t > result;
+    for( int64_t i = 0; i < hive::protocol::operation::count(); ++i )
+    {
+      std::string full;
+      operation_type_name visitor( full );
+      hive::protocol::operation op( i, visitor );
+      // hive::protocol::transfer_operation -> transfer_operation
+      const std::string name = full.substr( full.find_last_of( ':' ) + 1 );
+      result.emplace( name, i );
+      const std::string suffix = "_operation";
+      if( name.size() > suffix.size() && name.compare( name.size() - suffix.size(), suffix.size(), suffix ) == 0 )
+        result.emplace( name.substr( 0, name.size() - suffix.size() ), i );
+    }
+    return result;
+  }();
+  return ids;
+}
+
+// the lexer's classes, spelled out: the C locale functions would follow a
+// global locale the lexer does not
+bool is_letter( char c ) { return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ); }
+bool is_digit( char c ) { return c >= '0' && c <= '9'; }
+bool is_identifier_start( char c ) { return is_letter( c ) || c == '_'; }
+bool is_identifier_char( char c ) { return is_letter( c ) || is_digit( c ) || c == '_' || c == '-'; }
+bool is_number_char( char c ) { return is_digit( c ) || c == '.'; }
+
 } // anonymous namespace
+
+std::string resolve_operation_names( const std::string& match )
+{
+  // a scanner shaped like the be-tree lexer: string literals in either quote
+  // with backslash escapes, numbers, and identifiers [a-zA-Z_][a-zA-Z0-9_-]*;
+  // only an identifier token that names an operation is rewritten
+  const auto& ids = operation_type_ids();
+  std::string out;
+  out.reserve( match.size() );
+  size_t i = 0;
+  while( i < match.size() )
+  {
+    const char c = match[ i ];
+    size_t j = i + 1;
+    if( c == '"' || c == '\'' )
+    {
+      // an unterminated literal runs to the end; the parser reports it
+      while( j < match.size() && match[ j ] != c )
+        j += ( match[ j ] == '\\' ) ? 2 : 1;
+      j = std::min( j + 1, match.size() );
+    }
+    else if( is_number_char( c ) )
+    {
+      while( j < match.size() && is_number_char( match[ j ] ) )
+        ++j;
+    }
+    else if( is_identifier_start( c ) )
+    {
+      while( j < match.size() && is_identifier_char( match[ j ] ) )
+        ++j;
+      auto found = ids.find( match.substr( i, j - i ) );
+      if( found != ids.end() )
+      {
+        // the number must stay its own token when re-lexed: `2transfer` is
+        // two tokens the parser rejects, and must not come out as `22`
+        if( !out.empty() && is_number_char( out.back() ) )
+          out += ' ';
+        out += std::to_string( found->second );
+        if( j < match.size() && is_number_char( match[ j ] ) )
+          out += ' ';
+        i = j;
+        continue;
+      }
+    }
+    out.append( match, i, j - i );
+    i = j;
+  }
+  return out;
+}
 
 rules_config load_rules_file( const fc::path& path )
 {
@@ -93,6 +183,7 @@ rules_config load_rules_file( const fc::path& path )
         "hash collision between rule names \"${a}\" and \"${b}\" - rename one of them",
         ("a", inserted.first->second)("b", rule.name) );
       FC_ASSERT( !rule.match.empty(), "${w} has an empty match", ("w", what) );
+      rule.expr = resolve_operation_names( rule.match );
       FC_ASSERT( rule.enrich.empty(), "${w} uses \"enrich\", which is not implemented yet", ("w", what) );
     }
 

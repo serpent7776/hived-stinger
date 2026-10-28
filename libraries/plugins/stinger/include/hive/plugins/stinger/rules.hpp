@@ -56,9 +56,10 @@ enum class delivery_class : uint8_t
  * expression over the attribute vocabulary declared at startup (see
  * declare_rule_attributes in stinger_plugin.cpp); it is compiled when the
  * subscription index is built and a rule that fails to compile aborts
- * startup. `name` is the rule's public identity - match events carry it, so
- * renaming a rule means a new identity as far as stream consumers are
- * concerned.
+ * startup. An operation may be named in it instead of numbered - see
+ * resolve_operation_names. `name` is the rule's public identity - match
+ * events carry it, so renaming a rule means a new identity as far as stream
+ * consumers are concerned.
  */
 struct rule_definition
 {
@@ -74,6 +75,10 @@ struct rule_definition
   /// `name` - not part of the file format (a cross-name hash collision is
   /// rejected at load)
   uint64_t                    id = 0;
+  /// `match` with operation names resolved to op_type numbers - the
+  /// expression the be-tree compiles; derived by load_rules_file, not part
+  /// of the file format
+  std::string                 expr;
 };
 
 struct rules_config
@@ -97,6 +102,21 @@ struct rules_config
  * the index.
  */
 rules_config load_rules_file( const fc::path& path );
+
+/**
+ * Resolve operation names in a match expression to their op_type numbers.
+ * An identifier outside string literals that names an operation type - as
+ * database_api prints it, `transfer_operation`, or without the suffix,
+ * `transfer` - is replaced by the operation's index in
+ * hive::protocol::operation (virtual operations included), so
+ *
+ *   op_type = transfer                        -> op_type = 2
+ *   op_type in (transfer, escrow_transfer)    -> op_type in (2, 27)
+ *
+ * Everything else is copied as written, so an identifier that names nothing
+ * still reaches the be-tree parser and fails there with the rule named.
+ */
+std::string resolve_operation_names( const std::string& match );
 
 } } } // hive::plugins::stinger
 

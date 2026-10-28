@@ -891,6 +891,13 @@ void stinger_plugin_impl::stop_sink()
 /// registers the rule attributes and returns the event variable id betree assigned to each
 event_slots declare_rule_attributes( betree* tree )
 {
+  // an attribute is an identifier in the match expression, where an
+  // operation name is rewritten to its number: the vocabularies must not meet
+  for( const char* attr : { STINGER_ATTR_OP_TYPE, STINGER_ATTR_IMPACTED_ACCOUNTS, STINGER_ATTR_AMOUNT,
+                            STINGER_ATTR_SYMBOL, STINGER_ATTR_CUSTOM_ID } )
+    FC_ASSERT( resolve_operation_names( attr ) == attr,
+      "stinger: attribute \"${a}\" is also an operation name", ("a", attr) );
+
   event_slots slots;
 
   // op.which() over hive::protocol::operation (virtual ops included)
@@ -944,9 +951,10 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     size_t head_rules = 0;
     for( const auto& rule : my->rules.rules )
     {
-      FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.match.c_str() ),
-        "stinger: rule \"${n}\" (id ${i}) failed to parse: ${e}",
-        ("n", rule.name)("i", rule.id)("e", rule.match) );
+      FC_ASSERT( betree_insert( my->_matcher.get(), rule.id, rule.expr.c_str() ),
+        "stinger: rule \"${n}\" (id ${i}) failed to parse: ${m}${e}",
+        ("n", rule.name)("i", rule.id)("m", rule.match)
+        ("e", rule.expr == rule.match ? std::string() : " (compiled as: " + rule.expr + ")") );
       my->_rules_by_id.emplace( rule.id, &rule );
       if( rule.delivery == delivery_class::head )
         ++head_rules;

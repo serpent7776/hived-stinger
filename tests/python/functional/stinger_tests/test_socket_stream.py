@@ -29,9 +29,9 @@ def test_matches_reach_a_socket_consumer(tmp_path: Path) -> None:
     socket_path = enable_stinger(
         node,
         [
-            # irreversible, the default: satoshis of the primary asset and its symbol
-            rule("big-transfer", 'op_type = 2 and symbol = "TESTS" and amount >= 100000'),
-            # head: custom_json by id
+            # irreversible, the default: satoshis of the primary asset and its symbol; the operation by name
+            rule("big-transfer", 'op_type = transfer and symbol = "TESTS" and amount >= 100000'),
+            # head: custom_json by id; the operation by number
             rule("follow-json", 'op_type = 18 and custom_id = "follow"', delivery="head"),
             # head: anything touching alice, so the same operations show up under two rules
             rule("alice-head", '"alice" in impacted_accounts', delivery="head"),
