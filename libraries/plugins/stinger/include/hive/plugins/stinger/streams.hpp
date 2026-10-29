@@ -4,9 +4,11 @@
 
 #include <fc/exception/exception.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -21,11 +23,41 @@ namespace hive { namespace plugins { namespace stinger {
  * without a node (tests/unit/plugin_tests/stinger_streams_tests.cpp).
  */
 
+/// Batches of one class the ready queue dropped: how many, and the lowest
+/// and highest block among them. A batch is one block's matches, and the
+/// blocks of a run of same-class batches between two markers are distinct
+/// and ascending, so `batches` is the number of blocks of the range whose
+/// matches are gone; the others had none queued.
+struct dropped_range
+{
+  uint64_t batches     = 0;
+  uint32_t first_block = 0;
+  uint32_t last_block  = 0;
+
+  void add( uint32_t block_num )
+  {
+    first_block = batches == 0 ? block_num : std::min( first_block, block_num );
+    last_block  = batches == 0 ? block_num : std::max( last_block, block_num );
+    ++batches;
+  }
+  /// widen by another range's bounds and count
+  void merge( const dropped_range& other )
+  {
+    if( other.batches == 0 )
+      return;
+    first_block = batches == 0 ? other.first_block : std::min( first_block, other.first_block );
+    last_block  = batches == 0 ? other.last_block : std::max( last_block, other.last_block );
+    batches += other.batches;
+  }
+};
+
 /// One batch of frames for one delivery class, back to back, as the writer
 /// built them on its thread. For the irreversible class: a block's matches,
 /// handed to the sink once the block is irreversible. For the head class: a
 /// block's matches closed by its block_applied frame, handed over as the
-/// block is applied, or a lone irreversible or switch_fork marker.
+/// block is applied, or a lone irreversible or switch_fork marker. Or, once
+/// the ready queue has dropped batches, the tombstone that stands in for
+/// them: no frames, and `dropped` says which blocks' matches are gone.
 struct block_matches
 {
   delivery_class           cls       = delivery_class::irreversible;
@@ -35,6 +67,11 @@ struct block_matches
   uint32_t                 block_num = 0;
   uint32_t                 frames    = 0;
   std::vector< std::byte > bytes;
+  /// set on a tombstone (ready_queue): the dropped batches of this class
+  /// that stood here
+  dropped_range            dropped;
+
+  bool is_dropped() const { return dropped.batches != 0; }
 
   /// add one frame
   void append( const std::byte* frame, size_t len )
@@ -205,6 +242,108 @@ private:
   block_matches _current{ delivery_class::head };
   uint32_t      _last_block        = 0;
   uint32_t      _last_irreversible = 0;
+};
+
+/**
+ * The handoff from the writer to the sink: batches in the writer's order,
+ * held until the sink takes them, under a memory budget. The writer never
+ * waits for the sink: when a push takes the queue over its budget, the
+ * oldest batches of matches are dropped until it fits. What is dropped is
+ * what was waiting, never the batch just pushed - a batch larger than the
+ * whole budget still goes through, and the queue stands over budget by that
+ * one batch until the sink takes it - and never a marker: a lost
+ * switch_fork would leave a consumer holding retracted blocks as valid, and
+ * markers are a few dozen bytes.
+ *
+ * A dropped batch leaves a tombstone where it stood: a batch of no frames
+ * whose `dropped` says which blocks of its class are gone. The sink pops it
+ * in its turn and tells its consumers, so the news comes out exactly
+ * between what preceded the lost blocks and what followed them - after the
+ * switch_fork that preceded them, say, and not before it. Tombstones of one
+ * class fold into each other as long as no marker stands between them, so
+ * one never spans a fork switch, and a run between two markers holds at
+ * most one per class. The caller locks.
+ */
+class ready_queue
+{
+public:
+  explicit ready_queue( size_t byte_budget = 0 ) : _byte_budget( byte_budget ) {}
+
+  size_t byte_budget() const { return _byte_budget; }
+  bool   empty() const { return _queue.empty(); }
+  size_t size() const { return _queue.size(); }
+  /// bytes of the batches held
+  size_t bytes() const { return _bytes; }
+  /// batches dropped since construction
+  uint64_t dropped() const { return _dropped; }
+
+  /// queue a batch; the number of batches dropped to make room for it
+  size_t push( block_matches&& b )
+  {
+    _bytes += b.bytes.size();
+    _queue.push_back( std::move( b ) );
+    size_t evicted = 0;
+    while( _bytes > _byte_budget )
+    {
+      // the oldest batch of matches other than the one just pushed; the
+      // entries before _scan_from are known to be markers and tombstones
+      const auto last   = std::prev( _queue.end() );
+      const auto victim = std::find_if( _queue.begin() + _scan_from, last,
+        []( const block_matches& q ) { return !q.marker && !q.is_dropped(); } );
+      if( victim == last )
+        break;
+      _scan_from = size_t( victim - _queue.begin() );
+      _bytes -= victim->bytes.size();
+      ++evicted;
+
+      // fold into the tombstone of its class in the run just ahead of it,
+      // if there is one before the nearest marker; else become one in place
+      auto into = victim;
+      while( into != _queue.begin() && std::prev( into )->is_dropped() )
+      {
+        --into;
+        if( into->cls == victim->cls )
+          break;
+      }
+      if( into != victim && into->is_dropped() && into->cls == victim->cls )
+      {
+        into->dropped.add( victim->block_num );
+        _queue.erase( victim );
+      }
+      else
+      {
+        victim->dropped.add( victim->block_num );
+        victim->frames = 0;
+        victim->bytes  = {};
+        ++_scan_from;
+      }
+    }
+    _dropped += evicted;
+    return evicted;
+  }
+
+  /// take the oldest entry, a batch or a tombstone; false when there is none
+  bool pop( block_matches& out )
+  {
+    if( _queue.empty() )
+      return false;
+    out = std::move( _queue.front() );
+    _queue.pop_front();
+    _bytes -= out.bytes.size();
+    if( _scan_from != 0 )
+      --_scan_from;
+    return true;
+  }
+
+private:
+  size_t                      _byte_budget;
+  size_t                      _bytes   = 0;
+  uint64_t                    _dropped = 0;
+  std::deque< block_matches > _queue;
+  /// every entry before this index is a marker or a tombstone: where the
+  /// search for a victim starts, so a long stall costs each eviction O(1)
+  /// rather than a scan of everything the stall has piled up
+  size_t                      _scan_from = 0;
 };
 
 } } } // hive::plugins::stinger

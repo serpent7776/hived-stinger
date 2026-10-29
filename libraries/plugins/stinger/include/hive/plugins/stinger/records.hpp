@@ -2,6 +2,7 @@
 
 #include <hive/plugins/stinger/frame.hpp>
 #include <hive/plugins/stinger/rules.hpp>
+#include <hive/plugins/stinger/streams.hpp>
 
 #include <hive/protocol/types.hpp>
 
@@ -62,7 +63,7 @@ namespace hive { namespace plugins { namespace stinger {
  *     duplicates of it. null while the stream has not started - nothing
  *     matched yet, so where it will start is not known; 0 once it has and
  *     nothing is irreversible yet.
- *     Both positions assume the sink kept up; see block_applied for what a
+ *     Both positions assume the sink kept up; see dropped for what a
  *     consumer sees when it did not.
  *
  *   {"kind":"match","seq":N,"delivery":"irreversible"|"head","rules":["..."],
@@ -83,11 +84,33 @@ namespace hive { namespace plugins { namespace stinger {
  *     B and names the block now at B; irreversible says everything up to B
  *     is final. They exist only when a rule is delivered at head.
  *     block_applied heights are contiguous, except when the sink fell
- *     behind and dropped a block's batch, or failed to deliver it (hived
- *     logs both): then the height is skipped, its head matches are lost,
- *     and a consumer that sees the gap fetches the block from the node.
- *     The irreversible stream has no marker, so a dropped batch there is
- *     visible only in hived's log.
+ *     behind and dropped a block's batch (see dropped), or failed to
+ *     deliver it (hived logs it): then the height is skipped, its head
+ *     matches are lost, and a consumer that sees the gap fetches the block
+ *     from the node.
+ *
+ *   {"kind":"dropped","seq":N,"delivery":"irreversible"|"head",
+ *    "from_block":A,"to_block":B,"blocks":K}
+ *     the node fell behind and threw away the matches of K blocks of one
+ *     delivery class, all between A and B inclusive (blocks of the range
+ *     not counted had no matches), before they reached the socket. The
+ *     record stands where those blocks' records would have: after the
+ *     records of what preceded them, a switch_fork included, and before
+ *     those of what followed, so the records of this class that follow
+ *     are from blocks above B until the next switch_fork. Matches are held for
+ *     the sink under a memory budget (stinger-ready-queue-mb), and when a
+ *     burst of matches - a block with tens of thousands of virtual
+ *     operations, a sync faster than the sink renders - takes it over,
+ *     the oldest waiting blocks go. A consumer fetches the blocks of the
+ *     range from the node: for the irreversible class they are final; for
+ *     the head class they were applied, and a later switch_fork may still
+ *     retract them like any other. Every consumer connected at the time
+ *     gets the record; a consumer that connects later sees nothing, which
+ *     the positions in its hello allow for (they are where the streams
+ *     stand, not what reached the socket). `seq` is consumed like any
+ *     other record's: this is about the node's queue, not the socket -
+ *     a consumer that fell behind the socket is disconnected instead
+ *     (socket_sink.hpp).
  */
 
 /// What the hello record says about where each stream stands; see there.
@@ -137,6 +160,7 @@ public:
   const std::string& block_applied( uint32_t block_num, const protocol::block_id_type& block_id );
   const std::string& irreversible( uint32_t block_num );
   const std::string& switch_fork( uint32_t block_num, const protocol::block_id_type& block_id );
+  const std::string& dropped( delivery_class cls, const dropped_range& range );
 
 private:
   const std::string& marker( const char* kind, uint32_t block_num, const protocol::block_id_type* block_id );

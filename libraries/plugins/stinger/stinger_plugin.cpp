@@ -23,11 +23,11 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -42,6 +42,7 @@ extern "C" {
 #define STINGER_RULES_FILE_KEY "stinger-rules-file"
 #define STINGER_SOCKET_KEY     "stinger-socket"
 #define STINGER_MATCH_DURING_SYNC_KEY "stinger-match-during-sync"
+#define STINGER_READY_QUEUE_MB_KEY    "stinger-ready-queue-mb"
 
 namespace hive { namespace plugins { namespace stinger {
 
@@ -67,16 +68,20 @@ constexpr const char* STINGER_ATTR_IS_VIRTUAL        = "is_virtual";
 constexpr size_t STINGER_FRAME_BUDGET =
   size_t( HIVE_MAX_BLOCK_SIZE ) + match_frame_overhead( std::numeric_limits< uint16_t >::max() );
 
-/// Batches the writer holds for the sink before dropping the oldest batch
-/// of matches: the writer never waits for the sink. Head-stream markers are
-/// never dropped - a lost switch_fork would leave the consumer holding
-/// retracted blocks as valid - and are small, so they may push the queue
-/// past this while a sink stalls. A block costs one batch per class in use
-/// plus one for its irreversible marker, so with both classes this is about
-/// 17 minutes of sink outage at one block per 3 seconds; config knob later.
-constexpr size_t STINGER_READY_BATCHES_MAX = 1024;
+/// Default memory budget for the batches the writer holds for the sink
+/// (ready_queue, streams.hpp; stinger-ready-queue-mb). The queue is bounded
+/// in bytes, not batches: the matches of one block are a few hundred bytes
+/// on a live chain and over 50 MB on the block after hardfork 7, which pays
+/// out every pending comment at once, so a count says nothing about memory
+/// and a count sized for live operation lost the next six thousand blocks
+/// of matches during a sync. 128 MB holds that block and the blocks a sink
+/// stalled on it falls behind by at sync speed, and is hours of sink outage
+/// at live rates.
+constexpr size_t STINGER_READY_QUEUE_MB_DEFAULT = 128;
+/// the most the option accepts: 64 GB, more than any node has to spare
+constexpr size_t STINGER_READY_QUEUE_MB_MAX     = 64 * 1024;
 
-/// drops are reported at most this often
+/// drops are logged at most this often, on each side
 constexpr std::chrono::seconds DROP_LOG_INTERVAL{ 10 };
 
 /// The longest line the socket carries, newline included; a match whose
@@ -218,8 +223,13 @@ struct event_attribute_visitor
  * batches it waits on, in the writer's order, so each stream is in order;
  * beside it two atomics the writer sets for the sink's hello record, and
  * _sink_failed the other way.
- * The writer never blocks on the sink: a full queue drops the oldest batch,
- * counted and warned about.
+ * The writer never blocks on the sink: a queue over its memory budget
+ * drops the oldest batches of matches, counted and warned about on the
+ * writer's side as it happens, and leaves a tombstone in their place
+ * (ready_queue) that the sink pops in its turn - between what preceded the
+ * lost blocks and what followed them - and reports: in the log with the
+ * blocks concerned, and on the socket as a `dropped` record, so a consumer
+ * knows which blocks to fetch elsewhere.
  *
  * Matches held at shutdown - blocks applied but not yet irreversible - are
  * dropped and their block numbers logged: a restart replays those blocks
@@ -249,6 +259,12 @@ public:
   void retract_from( uint32_t block_num, const protocol::block_id_type& prev_id );
   /// hand a batch to the sink; the writer's side of _ready
   void push_ready( block_matches&& b );
+  /// the sink's side of a drop, a tombstone popped in its turn: tell the
+  /// consumers what is missing, and remember it for the log
+  void report_dropped( const block_matches& tombstone );
+  /// log the drops not logged yet, when it is time: at the first, when the
+  /// sink has drained the queue, or every DROP_LOG_INTERVAL while behind
+  void log_dropped_if_due( bool drained );
 
   /// the sink thread's body
   void sink_loop();
@@ -287,17 +303,18 @@ public:
   /// writer-private counters, folded into the shutdown report
   uint64_t _batches_released = 0;
   uint64_t _frames_released  = 0;
-  uint64_t _batches_dropped  = 0;
-  /// _batches_dropped as of the last drop warning, and when it was logged
+  /// the queue's drop total as of the writer's last drop warning, and when
+  /// it was logged
   uint64_t                              _drops_logged = 0;
   std::chrono::steady_clock::time_point _drop_log_time{};
 
   /// the release point: batches the sink has not taken yet, in the
-  /// writer's order. _ready_stopped is set by stop_sink() after the final push
-  std::mutex                  _ready_mutex;
-  std::condition_variable     _ready_cv;
-  std::deque< block_matches > _ready;
-  bool                        _ready_stopped = false;
+  /// writer's order, under a memory budget set in plugin_initialize.
+  /// _ready_stopped is set by stop_sink() after the final push
+  std::mutex              _ready_mutex;
+  std::condition_variable _ready_cv;
+  ready_queue             _ready;
+  bool                    _ready_stopped = false;
   /// the sink thread; a plain std::thread, not scheduled against appbase
   std::thread                      _sink;
 
@@ -339,6 +356,12 @@ public:
   /// told about - a tripwire for the order each stream promises, and for
   /// the head stream its position, with the block's id, for the hello record
   uint64_t                _batches_delivered           = 0;
+  /// sink-private: the drops reported to consumers but not logged yet, per
+  /// class; the total logged, and whether and when the sink last logged
+  std::array< dropped_range, 2 >        _drops_unlogged{};
+  uint64_t                              _drops_logged_by_sink = 0;
+  bool                                  _drops_ever_logged    = false;
+  std::chrono::steady_clock::time_point _drop_report_time{};
   uint32_t                _last_irreversible_delivered = 0;
   uint32_t                _last_head_delivered         = 0;
   protocol::block_id_type _last_head_delivered_id;
@@ -655,37 +678,73 @@ void stinger_plugin_impl::on_switch_fork( uint32_t new_head_block_num )
 void stinger_plugin_impl::push_ready( block_matches&& b )
 {
   uint64_t dropped_total = 0;
+  size_t   queued_bytes  = 0;
   _frames_released += b.frames;
   ++_batches_released;
   {
     std::lock_guard< std::mutex > lock( _ready_mutex );
-    _ready.push_back( std::move( b ) );
-    // evict the oldest batch of matches; markers stay, see STINGER_READY_BATCHES_MAX
-    while( _ready.size() > STINGER_READY_BATCHES_MAX )
+    // over budget, the oldest batches of matches go; markers stay (ready_queue)
+    if( _ready.push( std::move( b ) ) != 0 )
     {
-      const auto victim = std::find_if( _ready.begin(), _ready.end(),
-        []( const block_matches& q ) { return !q.marker; } );
-      if( victim == _ready.end() )
-        break;
-      _ready.erase( victim );
-      ++_batches_dropped;
-      dropped_total = _batches_dropped;
+      dropped_total = _ready.dropped();
+      queued_bytes  = _ready.bytes();
     }
   }
   _ready_cv.notify_one();
 
-  // reported outside the lock, rate limited; the clock is read on the drop path only
+  // Warned about outside the lock, rate limited, as it happens: the sink
+  // reports the blocks concerned when it gets to the queue again
+  // (report_dropped), which may be a while. The clock is read on the drop
+  // path only
   if( dropped_total != 0 )
   {
     const auto now = std::chrono::steady_clock::now();
     if( _drops_logged == 0 || now - _drop_log_time >= DROP_LOG_INTERVAL )
     {
-      wlog( "stinger: sink is behind - dropped ${n} batch(es) of matches, ${t} in total",
-        ("n", dropped_total - _drops_logged)("t", dropped_total) );
+      wlog( "stinger: sink is behind - dropped ${n} block(s) of matches to stay within ${m} MB (${q} bytes queued), ${t} dropped in total",
+        ("n", dropped_total - _drops_logged)("m", _ready.byte_budget() / ( 1024 * 1024 ))("q", queued_bytes)("t", dropped_total) );
       _drops_logged  = dropped_total;
       _drop_log_time = now;
     }
   }
+}
+
+void stinger_plugin_impl::report_dropped( const block_matches& tombstone )
+{
+  const dropped_range& r = tombstone.dropped;
+  if( _socket )
+    _socket->send( _records.dropped( tombstone.cls, r ) );
+  // for the log: one range per class, merged across tombstones, so over a
+  // fork switch it may count a height twice
+  _drops_unlogged[ size_t( tombstone.cls ) ].merge( r );
+}
+
+void stinger_plugin_impl::log_dropped_if_due( bool drained )
+{
+  uint64_t pending = 0;
+  for( const auto& r : _drops_unlogged )
+    pending += r.batches;
+  if( pending == 0 )
+    return;
+  // The first time at once; then when the burst is over - the sink has
+  // emptied the queue, so this is the whole of it - or every so often
+  // while the sink stays behind. The clock is read on this path only
+  const auto now = std::chrono::steady_clock::now();
+  if( _drops_ever_logged && !drained && now - _drop_report_time < DROP_LOG_INTERVAL )
+    return;
+  _drops_ever_logged     = true;
+  _drop_report_time      = now;
+  _drops_logged_by_sink += pending;
+  for( size_t c = 0; c < _drops_unlogged.size(); ++c )
+  {
+    const dropped_range& r = _drops_unlogged[ c ];
+    if( r.batches == 0 )
+      continue;
+    wlog( "stinger: the ${c} matches of ${n} block(s) between ${a} and ${b} were dropped while the sink was behind; ${t} dropped in total${s}",
+      ("c", delivery_class( c ))("n", r.batches)("a", r.first_block)("b", r.last_block)("t", _drops_logged_by_sink)
+      ("s", drained ? ", the sink has caught up" : "") );
+  }
+  _drops_unlogged = {};
 }
 
 void stinger_plugin_impl::sink_loop()
@@ -700,7 +759,8 @@ void stinger_plugin_impl::sink_loop()
     for( ;; )
     {
       block_matches b;
-      bool          have = false;
+      bool          have    = false;
+      bool          drained = false;
       {
         std::unique_lock< std::mutex > lock( _ready_mutex );
         // with a socket the wait is bounded, so consumers are accepted and
@@ -709,11 +769,10 @@ void stinger_plugin_impl::sink_loop()
           _ready_cv.wait_for( lock, SINK_POLL_INTERVAL, ready );
         else
           _ready_cv.wait( lock, ready );
-        if( !_ready.empty() )
+        if( _ready.pop( b ) )
         {
-          b = std::move( _ready.front() );
-          _ready.pop_front();
-          have = true;
+          have    = true;
+          drained = _ready.empty();
         }
         else if( _ready_stopped )
           break;  // stop is set after the final release: drained
@@ -734,7 +793,10 @@ void stinger_plugin_impl::sink_loop()
       // exception escaping a std::thread is std::terminate
       try
       {
-        deliver_block( b );
+        if( b.is_dropped() )
+          report_dropped( b );
+        else
+          deliver_block( b );
       }
       catch( const fc::exception& e )
       {
@@ -748,6 +810,7 @@ void stinger_plugin_impl::sink_loop()
       {
         elog( "stinger: sink dropped block ${b}: unknown exception", ("b", b.block_num) );
       }
+      log_dropped_if_due( drained );
     }
     return;
   }
@@ -920,12 +983,13 @@ void stinger_plugin_impl::stop_sink()
   // 5. the sink exits once it has drained the queue
   _sink.join();
 
+  // the queue is the sink's alone now; no lock
   if( _sink_failed.load( std::memory_order_relaxed ) )
     elog( "stinger: sink had died - ${r} batch(es) released, ${c} delivered, ${d} dropped, ${f} frame(s)",
-      ("r", _batches_released)("c", _batches_delivered)("d", _batches_dropped)("f", _frames_released) );
+      ("r", _batches_released)("c", _batches_delivered)("d", _ready.dropped())("f", _frames_released) );
   else
     ilog( "stinger: sink stopped - ${r} batch(es) released, ${c} delivered, ${d} dropped, ${f} frame(s)",
-      ("r", _batches_released)("c", _batches_delivered)("d", _batches_dropped)("f", _frames_released) );
+      ("r", _batches_released)("c", _batches_delivered)("d", _ready.dropped())("f", _frames_released) );
   // 6. the socket goes with the sink thread that served it; consumers see EOF
   if( _socket )
   {
@@ -985,6 +1049,8 @@ void stinger_plugin::set_program_options( boost::program_options::options_descri
       "Path of the unix socket the stinger match stream is served on, as newline-delimited JSON. Required when a rule's exec type is socket." )
     ( STINGER_MATCH_DURING_SYNC_KEY, boost::program_options::value<bool>()->default_value( false ),
       "Match operations of blocks received while the node is still syncing (backfill). By default matching starts when the node enters live mode. Replayed blocks are never matched." )
+    ( STINGER_READY_QUEUE_MB_KEY, boost::program_options::value<uint32_t>()->default_value( detail::STINGER_READY_QUEUE_MB_DEFAULT ),
+      "Memory, in MB, for matches waiting to be delivered. When delivery falls behind by more than this, the matches of the oldest waiting blocks are dropped; hived logs it and socket consumers get a dropped record naming the blocks." )
     ;
 }
 
@@ -1040,6 +1106,16 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
     else
       FC_ASSERT( socket_rules == 0,
         "stinger: ${n} rule(s) have exec type socket but " STINGER_SOCKET_KEY " is not set", ("n", socket_rules) );
+
+    // the queue's budget; the sink thread is not running yet
+    // the upper bound is there for a negative value, which the option
+    // parser wraps to a huge one
+    const uint32_t queue_mb = options.at( STINGER_READY_QUEUE_MB_KEY ).as< uint32_t >();
+    FC_ASSERT( queue_mb >= 1 && queue_mb <= detail::STINGER_READY_QUEUE_MB_MAX,
+      "stinger: " STINGER_READY_QUEUE_MB_KEY " must be between 1 and ${m}, got ${v}",
+      ("m", detail::STINGER_READY_QUEUE_MB_MAX)("v", queue_mb) );
+    my->_ready = ready_queue( size_t( queue_mb ) * 1024 * 1024 );
+    ilog( "stinger: ${m} MB of matches held for delivery before the oldest are dropped", ("m", queue_mb) );
 
     // the encoder and the sink thread must exist before the handlers
     // connect, for the same reason as the index; the sink reads

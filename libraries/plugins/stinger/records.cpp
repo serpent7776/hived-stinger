@@ -102,6 +102,17 @@ const std::string& record_writer::switch_fork( uint32_t block_num, const protoco
   return marker( "switch_fork", block_num, &block_id );
 }
 
+const std::string& record_writer::dropped( delivery_class cls, const dropped_range& range )
+{
+  FC_ASSERT( range.batches != 0, "a dropped record must name at least one block" );
+  fc::mutable_variant_object obj;
+  obj( "kind", "dropped" )( "seq", _next_seq )( "delivery", cls )
+     ( "from_block", range.first_block )( "to_block", range.last_block )( "blocks", range.batches );
+  render( obj, _line );
+  ++_next_seq;
+  return _line;
+}
+
 const std::string& record_writer::marker( const char* kind, uint32_t block_num, const protocol::block_id_type* block_id )
 {
   fc::mutable_variant_object obj;

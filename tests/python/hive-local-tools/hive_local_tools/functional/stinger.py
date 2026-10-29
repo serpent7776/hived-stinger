@@ -210,6 +210,9 @@ def assert_well_formed(records: list[Record]) -> None:
         assert r["seq"] == expected, f"seq gap: expected {expected}, got {r}"
         expected += 1
     for r in sequenced:
-        assert r["kind"] in {"match", "block_applied", "irreversible", "switch_fork"}, r
+        assert r["kind"] in {"match", "block_applied", "irreversible", "switch_fork", "dropped"}, r
+        if r["kind"] == "dropped":
+            assert r["delivery"] in {"irreversible", "head"}, r
+            assert 1 <= r["blocks"] <= r["to_block"] - r["from_block"] + 1, r
     # irreversible matches may trail below the hello's irreversible bound; nothing is promised about them
     _assert_head_position_is_a_cut(hello, sequenced)

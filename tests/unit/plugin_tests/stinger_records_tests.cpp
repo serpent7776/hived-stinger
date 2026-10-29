@@ -276,6 +276,36 @@ BOOST_AUTO_TEST_CASE( markers )
   BOOST_CHECK_EQUAL( w.next_seq(), 4u );
 }
 
+BOOST_AUTO_TEST_CASE( dropped_record_names_the_class_and_the_blocks )
+{
+  record_writer w( NO_LIMIT );
+  dropped_range r;
+  r.add( 2889021 );
+  r.add( 2894813 );
+  r.add( 2890000 );
+  auto rec = parse( w.dropped( delivery_class::irreversible, r ) );
+  BOOST_CHECK_EQUAL( rec[ "kind" ].as_string(), "dropped" );
+  BOOST_CHECK_EQUAL( rec[ "seq" ].as_uint64(), 1u );
+  BOOST_CHECK_EQUAL( rec[ "delivery" ].as_string(), "irreversible" );
+  BOOST_CHECK_EQUAL( rec[ "from_block" ].as_uint64(), 2889021u );
+  BOOST_CHECK_EQUAL( rec[ "to_block" ].as_uint64(), 2894813u );
+  BOOST_CHECK_EQUAL( rec[ "blocks" ].as_uint64(), 3u );
+  BOOST_CHECK( !rec.contains( "block" ) );
+
+  dropped_range one;
+  one.add( 5 );
+  rec = parse( w.dropped( delivery_class::head, one ) );
+  BOOST_CHECK_EQUAL( rec[ "delivery" ].as_string(), "head" );
+  BOOST_CHECK_EQUAL( rec[ "seq" ].as_uint64(), 2u );
+  BOOST_CHECK_EQUAL( rec[ "from_block" ].as_uint64(), 5u );
+  BOOST_CHECK_EQUAL( rec[ "to_block" ].as_uint64(), 5u );
+  BOOST_CHECK_EQUAL( rec[ "blocks" ].as_uint64(), 1u );
+  BOOST_CHECK_EQUAL( w.next_seq(), 3u );
+
+  // nothing dropped is not a record
+  BOOST_CHECK_THROW( w.dropped( delivery_class::head, dropped_range{} ), fc::exception );
+}
+
 BOOST_AUTO_TEST_CASE( records_are_single_lines )
 {
   // a memo with a newline and a quote stays inside the JSON string
