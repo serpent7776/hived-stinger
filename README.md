@@ -1,5 +1,110 @@
 # Hive - Decentralizing the exchange of ideas and information
 
+## Stinger: matched operations, pushed to your process
+
+This repo adds `stinger`, a hived plugin that watches every operation the
+node applies, real and virtual, and hands the ones that match your rules to
+your own process as JSON lines on a unix socket. It exists for the
+integration that today means either running HAF or polling the APIs: "tell
+me when someone pays my account", "give me every custom_json my app
+emits", "alert on transfers over a threshold". A rules file does it in a few
+lines (a fuller one is at
+[libraries/plugins/stinger/example_rules.json](libraries/plugins/stinger/example_rules.json)):
+
+```json
+{ "rules": [
+  { "name": "shop-paid",
+    "match": "op_type in (transfer, fill_recurrent_transfer) and to = \"shop\"",
+    "exec": { "type": "socket" } },
+  { "name": "large-hive-transfer",
+    "match": "op_type = transfer and symbol = \"HIVE\" and amount > 1000000",
+    "exec": { "type": "socket" }, "delivery": "head" }
+] }
+```
+
+```
+plugin = stinger
+stinger-rules-file = rules.json
+stinger-socket = /run/hived/stinger.sock
+```
+
+Why it is shaped the way it is:
+
+* **Matching happens where the data is.** Rules are evaluated on the node's
+  writer thread as each operation is applied, against a boolean-expression
+  index (a vendored be-tree), so the cost is a bounded microsecond or so per
+  operation and no user code ever runs on the consensus path. Rules are
+  declarative JSON, parsed at startup; there is no script.
+* **Irreversible by default, head when you ask.** Hive makes a block
+  irreversible about one block after it is applied, so the default stream
+  delivers a block's matches once they cannot be undone and consumers never
+  see a fork. A rule can opt into `head` delivery for one block less latency,
+  and then gets `block_applied`, `switch_fork` and `irreversible` markers to
+  retract and settle with.
+* **The node keeps no history and no consumer state.** The stream is
+  ephemeral; a consumer owns its own storage and fork policy. Every record is
+  self-contained (the full operation in database_api form, block, trx id,
+  timestamp), the greeting on connect says where each stream stands, and
+  what came before that is fetched from the node's APIs. Nothing here
+  rebuilds HAF.
+* **The writer never waits.** Matches go to a sink thread through a queue
+  bounded in bytes (`stinger-ready-queue-mb`, 128 MB by default); if a
+  consumer falls behind the socket it is disconnected, if the sink falls
+  behind the writer the oldest blocks' matches are dropped and every
+  consumer gets a `dropped` record naming the blocks. The failure is loud and
+  the node is unaffected.
+* **No outbound network.** The sinks are a log line and a local socket;
+  webhooks, queues and WebSockets belong in a bridge process on the far side
+  of the socket, not inside hived.
+
+### What a rule can match on
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `op_type` | integer | the operation's type, written by name (`transfer`, `custom_json_operation`, `producer_reward`) or by its number in the protocol's operation variant; virtual operations included |
+| `is_virtual` | boolean | whether the operation is virtual; tested bare: `is_virtual`, `not is_virtual` |
+| `impacted_accounts` | list of strings | every account the operation touches, as account history sees it (sender and receiver, author and voter, the witness of a reward) |
+| `amount`, `symbol` | integer, string | the operation's own `amount` field, in satoshis, and its asset symbol (`HIVE`, `HBD`, `VESTS`, or `TESTS` / `TBD` on a testnet); the transfer family, the savings and recurrent transfers and their virtual fills, and the two converts have one. Undefined elsewhere, so `amount > X` alone never fires on a fill_order or a reward |
+| `custom_id` | string | the `id` of a custom_json operation; undefined for other types |
+| `from`, `to` | string | the operation's own `from` and `to` account fields: transfers, savings, escrows, recurrent transfers and their fills. Undefined when the operation has no such field or leaves it empty (a power-up to oneself has no `to`) |
+
+Attributes compare to literals only, never to each other: `from = to` is
+not expressible, and a derived flag for such a relation is added on
+request rather than guessed. An undefined attribute fails every test on
+it, which is why a rule on `amount` or `custom_id` usually carries an
+`op_type` term as well, and why one on `impacted_accounts` alone is the
+expensive kind (every operation reaches it; keep those to a few dozen).
+
+### The expression language
+
+Rules are boolean expressions over those attributes, parsed once at
+startup, with nothing to execute:
+
+* comparisons `=`, `<>`, `<`, `<=`, `>`, `>=` between an attribute and a
+  number or a quoted string, either side first: `amount >= 1000000`,
+  `"HIVE" = symbol`;
+* membership `in` and `not in` with a list in parentheses: `op_type in
+  (transfer, transfer_to_vesting)`, `custom_id not in ("sm_market",
+  "sm_sell")`; and for the list attribute, a string against it: `"alice"
+  in impacted_accounts`, or a list against it with `one of`, `none of`,
+  `all of`: `impacted_accounts one of ("alice", "bob")`;
+* `and`, `or`, `not` and parentheses, with `not` binding tightest;
+* a bare boolean attribute as a term: `is_virtual`.
+
+Operation names are rewritten to their numbers before parsing, so a name
+is valid wherever an integer is. Strings are case-sensitive and compared
+whole; there is no pattern matching. A rule that does not parse stops the
+node at startup, naming the rule.
+
+Matching starts when the node is live (`stinger-match-during-sync` turns it
+on for the sync too). Meant for API and seed nodes; it is discretionary
+work on the block-apply path, so not for witness nodes. The record format
+and the consumer contract are documented in
+[libraries/plugins/stinger/](libraries/plugins/stinger/), starting from
+[example_rules.json](libraries/plugins/stinger/example_rules.json) and
+[records.hpp](libraries/plugins/stinger/include/hive/plugins/stinger/records.hpp).
+
+
 [![GitLab](https://img.shields.io/badge/Development%20on-Community%20GitLab-orange)](https://gitlab.syncad.com/hive/hive)
 
 This project is primarily developed on a community-hosted GitLab instance. Please visit the [community GitLab repository](https://gitlab.syncad.com/hive/hive) for the latest updates, issues, and contributions.
