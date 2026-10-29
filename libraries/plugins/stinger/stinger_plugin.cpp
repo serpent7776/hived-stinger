@@ -1001,6 +1001,15 @@ void stinger_plugin_impl::stop_sink()
   }
 }
 
+/// A path option taken as hived takes its other path options
+/// (shared-file-dir, account-history-rocksdb-path): relative to the data
+/// dir, not to the cwd hived happened to be started from.
+fc::path resolve_against_data_dir( const appbase::application& app, const std::string& option )
+{
+  const boost::filesystem::path p( option );
+  return p.is_absolute() ? p : app.data_dir() / p;
+}
+
 /// registers the rule attributes and returns the event variable id betree assigned to each
 event_slots declare_rule_attributes( betree* tree )
 {
@@ -1044,9 +1053,9 @@ stinger_plugin::~stinger_plugin() {}
 void stinger_plugin::set_program_options( boost::program_options::options_description& cli, boost::program_options::options_description& cfg )
 {
   cfg.add_options()
-    ( STINGER_RULES_FILE_KEY, boost::program_options::value<std::string>(), "Path to the file with stinger rule definitions." )
+    ( STINGER_RULES_FILE_KEY, boost::program_options::value<std::string>(), "Path to the file with stinger rule definitions; a relative path is taken from the data directory." )
     ( STINGER_SOCKET_KEY, boost::program_options::value<std::string>(),
-      "Path of the unix socket the stinger match stream is served on, as newline-delimited JSON. Required when a rule's exec type is socket." )
+      "Path of the unix socket the stinger match stream is served on, as newline-delimited JSON; a relative path is taken from the data directory, and the whole path must fit the 107 bytes of a unix socket address. Required when a rule's exec type is socket." )
     ( STINGER_MATCH_DURING_SYNC_KEY, boost::program_options::value<bool>()->default_value( false ),
       "Match operations of blocks received while the node is still syncing (backfill). By default matching starts when the node enters live mode. Replayed blocks are never matched." )
     ( STINGER_READY_QUEUE_MB_KEY, boost::program_options::value<uint32_t>()->default_value( detail::STINGER_READY_QUEUE_MB_DEFAULT ),
@@ -1063,7 +1072,7 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
 
     FC_ASSERT( options.count( STINGER_RULES_FILE_KEY ),
       "stinger: " STINGER_RULES_FILE_KEY " is required when the stinger plugin is enabled" );
-    my->rules_file = options.at( STINGER_RULES_FILE_KEY ).as< std::string >();
+    my->rules_file = detail::resolve_against_data_dir( get_app(), options.at( STINGER_RULES_FILE_KEY ).as< std::string >() );
     my->rules = load_rules_file( my->rules_file );
     ilog( "stinger: loaded ${n} rule(s) from ${f}",
       ("n", my->rules.rules.size())("f", my->rules_file.generic_string()) );
@@ -1100,7 +1109,8 @@ void stinger_plugin::plugin_initialize( const boost::program_options::variables_
       []( const rule_definition& r ) { return r.exec.type == exec_type::socket; } );
     if( options.count( STINGER_SOCKET_KEY ) )
     {
-      my->_socket = std::make_unique< socket_sink >( fc::path( options.at( STINGER_SOCKET_KEY ).as< std::string >() ) );
+      my->_socket = std::make_unique< socket_sink >(
+        detail::resolve_against_data_dir( get_app(), options.at( STINGER_SOCKET_KEY ).as< std::string >() ) );
       ilog( "stinger: serving ${n} rule(s) on socket ${p}", ("n", socket_rules)("p", my->_socket->path().generic_string()) );
     }
     else

@@ -28,6 +28,9 @@ stinger-rules-file = rules.json
 stinger-socket = /run/hived/stinger.sock
 ```
 
+Relative paths in both options are taken from the data directory, as for
+hived's other path options.
+
 Why it is shaped the way it is:
 
 * **Matching happens where the data is.** Rules are evaluated on the node's
