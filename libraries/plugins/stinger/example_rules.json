@@ -19,6 +19,17 @@
       "name": "splinterlands-market",
       "match": "op_type = custom_json and custom_id = \"sm_market\"",
       "exec": { "type": "log" }
+    },
+    {
+      "name": "team-rewards",
+      "match": "op_type in (author_reward, curation_reward) and impacted_accounts one of (\"alice\", \"bob\", \"carol\")",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "my-witness-produced",
+      "match": "op_type = producer_reward and \"mywitness\" in impacted_accounts",
+      "exec": { "type": "socket" },
+      "delivery": "head"
     }
   ]
 }
