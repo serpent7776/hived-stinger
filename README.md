@@ -107,6 +107,34 @@ and the consumer contract are documented in
 [example_rules.json](libraries/plugins/stinger/example_rules.json) and
 [records.hpp](libraries/plugins/stinger/include/hive/plugins/stinger/records.hpp).
 
+### Try it in two minutes
+
+Stinger is compiled into hived, like every hive plugin, so trying it means
+running a hived built from this branch. The quickest way is a one-node
+testnet; the demo script starts one, attaches a consumer to its socket, and
+makes a few payments that the demo rules match:
+
+```
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_HIVE_TESTNET=ON -GNinja ../ && ninja hived cli_wallet
+libraries/plugins/stinger/demo/run_demo.sh
+```
+
+```
+match               #8 head          transfer from=initminer to=shop amount=1250.000 TESTS memo=order 42  [shop-paid,large-transfer]
+match               #9 head          transfer from=alice to=shop amount=2.000 TESTS memo=order 43  [shop-paid]
+...
+match               #6 irreversible  transfer from=initminer to=alice amount=10.000 TESTS memo=welcome  [alice-activity]
+```
+
+It runs for two minutes, long enough for the irreversible stream to catch up
+with the head one, then stops the node and removes its data. `--keep` keeps
+the node, wallet and consumer logs; `--raw` prints the records as the JSON
+lines they are; `--help` lists the rest. The rules it runs are in
+[demo/rules.json](libraries/plugins/stinger/demo/rules.json), and
+[demo/consumer.py](libraries/plugins/stinger/demo/consumer.py) is a small
+reference consumer: it checks the greeting, watches the sequence numbers and
+prints one line per record.
+
 
 [![GitLab](https://img.shields.io/badge/Development%20on-Community%20GitLab-orange)](https://gitlab.syncad.com/hive/hive)
 

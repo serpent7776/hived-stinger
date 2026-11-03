@@ -1,0 +1,27 @@
+{
+  "rules": [
+    {
+      "name": "shop-paid",
+      "match": "op_type in (transfer, fill_recurrent_transfer) and to = \"shop\"",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    },
+    {
+      "name": "large-transfer",
+      "match": "op_type = transfer and amount >= 1000000",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    },
+    {
+      "name": "alice-activity",
+      "match": "\"alice\" in impacted_accounts and not is_virtual",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "initminer-produced",
+      "match": "op_type = producer_reward and \"initminer\" in impacted_accounts",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    }
+  ]
+}
