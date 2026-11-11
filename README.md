@@ -1,12 +1,14 @@
-# Hive - Decentralizing the exchange of ideas and information
-
-## Stinger: matched operations, pushed to your process
+# Stinger: matched operations, pushed to your process
 
 <p align="center">
   <img src="libraries/plugins/stinger/stinger-icon.svg" alt="stinger icon" width="128">
 </p>
 
-This repo adds `stinger`, a hived plugin that watches every operation the
+This is a branch of [Hive](https://gitlab.syncad.com/hive/hive) that adds one
+thing: `stinger`. The first part of this README is about stinger; Hive's own
+README follows it under [Hive](#hive).
+
+Stinger is a hived plugin that watches every operation the
 node applies, real and virtual, and hands the ones that match your rules to
 your own process as JSON lines on a unix socket. It exists for the
 integration that today means either running HAF or polling the APIs: "tell
@@ -64,7 +66,7 @@ Why it is shaped the way it is:
   webhooks, queues and WebSockets belong in a bridge process on the far side
   of the socket, not inside hived.
 
-### What a rule can match on
+## What a rule can match on
 
 | Attribute | Type | Meaning |
 |---|---|---|
@@ -82,7 +84,7 @@ it, which is why a rule on `amount` or `custom_id` usually carries an
 `op_type` term as well, and why one on `impacted_accounts` alone is the
 expensive kind (every operation reaches it; keep those to a few dozen).
 
-### The expression language
+## The expression language
 
 Rules are boolean expressions over those attributes, parsed once at
 startup, with nothing to execute:
@@ -143,7 +145,7 @@ payload in the record; a head-delivered twin feeds a live view, a
 `account_created` stands in for the accounts table nft_tracker joins against
 when it validates holders, owners and issuers.
 
-### Try it in two minutes
+## Try it in two minutes
 
 Stinger is compiled into hived, like every hive plugin, so trying it means
 running a hived built from this branch. The quickest way is a one-node
@@ -171,6 +173,11 @@ lines they are; `--help` lists the rest. The rules it runs are in
 reference consumer: it checks the greeting, watches the sequence numbers and
 prints one line per record.
 
+---
+
+<a id="hive"></a>
+
+# Hive - Decentralizing the exchange of ideas and information
 
 [![GitLab](https://img.shields.io/badge/Development%20on-Community%20GitLab-orange)](https://gitlab.syncad.com/hive/hive)
 
