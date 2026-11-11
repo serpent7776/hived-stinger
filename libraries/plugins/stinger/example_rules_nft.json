@@ -1,0 +1,46 @@
+{
+  "rules": [
+    {
+      "name": "hive-engine-contracts",
+      "match": "op_type = custom_json and custom_id = \"ssc-mainnet-hive\"",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "splinterlands-card-ownership",
+      "match": "op_type = custom_json and custom_id in (\"sm_gift_cards\", \"sm_market_purchase\", \"sm_open_all\", \"sm_combine_cards\", \"sm_combine_all\", \"sm_burn_cards\", \"sm_unbind_cards\")",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "splinterlands-card-market",
+      "match": "op_type = custom_json and custom_id in (\"sm_sell_cards\", \"sm_market_list\", \"sm_update_price\", \"sm_cancel_sell\", \"sm_market_rent\", \"sm_fill_market_rental\", \"sm_market_renew_rental\", \"sm_update_rental_price\", \"sm_market_cancel_rental\", \"sm_expire_market_rental\", \"sm_delegate_cards\", \"sm_undelegate_cards\")",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "my-nft-state",
+      "match": "op_type = custom_json and custom_id in (\"my-nft-mint\", \"my-nft-transfer\", \"my-nft-burn\", \"my-nft-list\", \"my-nft-unlist\", \"my-nft-buy\")",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "my-nft-live-market",
+      "match": "op_type = custom_json and custom_id in (\"my-nft-list\", \"my-nft-unlist\", \"my-nft-buy\")",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    },
+    {
+      "name": "my-nft-sale-paid",
+      "match": "op_type in (transfer, fill_recurrent_transfer) and to = \"my-nft-market\" and symbol in (\"HIVE\", \"HBD\")",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "my-nft-operator-accounts",
+      "match": "op_type in (account_update, account_update2, change_recovery_account, request_account_recovery, recover_account) and impacted_accounts one of (\"my-nft-market\", \"my-nft-minter\")",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    },
+    {
+      "name": "accounts-created",
+      "match": "op_type = account_created",
+      "exec": { "type": "socket" }
+    }
+  ]
+}

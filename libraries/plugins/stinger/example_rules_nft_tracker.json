@@ -1,0 +1,25 @@
+{
+  "rules": [
+    {
+      "name": "nft-tracker-ops",
+      "match": "op_type = custom_json and custom_id = \"NFT\"",
+      "exec": { "type": "socket" }
+    },
+    {
+      "name": "nft-tracker-live",
+      "match": "op_type = custom_json and custom_id = \"NFT\"",
+      "exec": { "type": "socket" },
+      "delivery": "head"
+    },
+    {
+      "name": "nft-tracker-alice-ops",
+      "match": "op_type = custom_json and custom_id = \"NFT\" and \"alice\" in impacted_accounts",
+      "exec": { "type": "log" }
+    },
+    {
+      "name": "accounts-created",
+      "match": "op_type = account_created",
+      "exec": { "type": "socket" }
+    }
+  ]
+}

@@ -107,6 +107,38 @@ and the consumer contract are documented in
 [example_rules.json](libraries/plugins/stinger/example_rules.json) and
 [records.hpp](libraries/plugins/stinger/include/hive/plugins/stinger/records.hpp).
 
+A worked rules file for an NFT backend is in
+[example_rules_nft.json](libraries/plugins/stinger/example_rules_nft.json).
+NFTs on Hive live in `custom_json`, so the file matches by `custom_id`: every
+Hive Engine contract call (`ssc-mainnet-hive`; the `nft`, `nftmarket` and
+`nftauction` contracts are told apart by the `contractName` in the payload,
+which is the consumer's job, as a rule sees the id and not the body), the
+Splinterlands card ids as they appear on mainnet in November 2026 (one rule
+for what changes a card's owner, one for the sale, rental and delegation
+market; the game adds ids over time, so take the current list from a block
+explorer), and a placeholder app's own ids (`my-nft-*`), which
+you replace with yours. Around them: the app's market actions once more at
+head for a live view (a block's head matches arrive before its irreversible
+ones, and `switch_fork` tells the consumer what to retract), payments in
+HIVE or HBD to the market account for listings settled by `transfer`, key
+and recovery changes on the app's operator accounts, and `account_created`
+so the consumer knows which account names in the payloads exist. State is
+built from the irreversible rules only; the head rules drive the UI.
+
+[example_rules_nft_tracker.json](libraries/plugins/stinger/example_rules_nft_tracker.json)
+is the same idea for the
+[nft_tracker](https://gitlab.syncad.com/hive/nft_tracker) protocol, whose
+whole state is `custom_json` with id `NFT`: `register`, `modify`, `issue`,
+`soulbind`, `set_data`, `update_tags` and `transfer` actions, one per
+operation or an array of them, acted on behalf of the first active
+authority. One rule matches the id, so the consumer gets exactly the
+operations nft_tracker's HAF loop selects, with `required_auths` and the
+payload in the record; a head-delivered twin feeds a live view, a
+`log`-only rule shows how to narrow to one account's NFT actions
+(`impacted_accounts` of a custom_json are its authorities), and
+`account_created` stands in for the accounts table nft_tracker joins against
+when it validates holders, owners and issuers.
+
 ### Try it in two minutes
 
 Stinger is compiled into hived, like every hive plugin, so trying it means
