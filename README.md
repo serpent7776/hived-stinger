@@ -2,6 +2,10 @@
 
 ## Stinger: matched operations, pushed to your process
 
+<p align="center">
+  <img src="libraries/plugins/stinger/stinger-icon.svg" alt="stinger icon" width="128">
+</p>
+
 This repo adds `stinger`, a hived plugin that watches every operation the
 node applies, real and virtual, and hands the ones that match your rules to
 your own process as JSON lines on a unix socket. It exists for the

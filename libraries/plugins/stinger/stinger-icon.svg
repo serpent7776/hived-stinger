@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="stinger">
+  <title>stinger</title>
+  <defs>
+    <linearGradient id="cell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F0294B"/>
+      <stop offset="1" stop-color="#B80D2B"/>
+    </linearGradient>
+    <linearGradient id="body" gradientUnits="userSpaceOnUse" x1="0" y1="14" x2="0" y2="42">
+      <stop offset="0" stop-color="#FFE066"/>
+      <stop offset="1" stop-color="#FF9F1C"/>
+    </linearGradient>
+  </defs>
+  <!-- honeycomb cell in Hive red -->
+  <polygon points="32,3 57,17.5 57,46.5 32,61 7,46.5 7,17.5"
+           fill="url(#cell)" stroke="url(#cell)" stroke-width="4" stroke-linejoin="round"/>
+  <!-- striped abdomen in honey amber; chevrons echo the Hive mark -->
+  <g fill="url(#body)">
+    <polygon points="18,14 32,18 46,14 44,20 32,24 20,20"/>
+    <polygon points="21,23 32,27 43,23 41,29 32,33 23,29"/>
+    <polygon points="24,32 32,36 40,32 38,38 32,42 26,38"/>
+  </g>
+  <!-- the sting -->
+  <polygon points="27,41 32,45 37,41 32,58" fill="#FFFFFF"/>
+</svg>
