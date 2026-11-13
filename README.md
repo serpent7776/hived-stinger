@@ -4,7 +4,7 @@
   <img src="libraries/plugins/stinger/stinger-icon.svg" alt="stinger icon" width="128">
 </p>
 
-This is a branch of [Hive](https://gitlab.syncad.com/hive/hive) that adds one
+This is a fork of [Hive](https://gitlab.syncad.com/hive/hive) that adds one
 thing: `stinger`. The first part of this README is about stinger; Hive's own
 README follows it under [Hive](#hive).
 
