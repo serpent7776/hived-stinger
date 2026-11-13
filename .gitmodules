@@ -22,4 +22,5 @@
 	url = https://gitlab.syncad.com/hive/appbase.git
 [submodule "libraries/vendor/be-tree"]
 	path = libraries/vendor/be-tree
-	url = https://github.com/adgear/be-tree.git
+	url = https://github.com/serpent7776/be-tree.git
+	branch = stinger
