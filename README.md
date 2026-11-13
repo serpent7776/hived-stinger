@@ -44,16 +44,17 @@ Why it is shaped the way it is:
   index (a vendored be-tree), so the cost is a bounded microsecond or so per
   operation and no user code ever runs on the consensus path. Rules are
   declarative JSON, parsed at startup; there is no script.
-* **Irreversible by default, head when you ask.** Hive makes a block
-  irreversible about one block after it is applied, so the default stream
-  delivers a block's matches once they cannot be undone and consumers never
-  see a fork. A rule can opt into `head` delivery for one block less latency,
+* **Irreversible by default, head when you ask.** Hive normally makes a
+  block irreversible within about a second of applying it, so the default
+  stream delivers a block's matches once they cannot be undone and consumers
+  never see a fork. A rule can opt into `head` delivery to skip that wait,
   and then gets `block_applied`, `switch_fork` and `irreversible` markers to
   retract and settle with.
 * **The node keeps no history and no consumer state.** The stream is
   ephemeral; a consumer owns its own storage and fork policy. Every record is
-  self-contained (the full operation in database_api form, block, trx id,
-  timestamp), the greeting on connect says where each stream stands, and
+  self-contained (the full operation in the form block_api and
+  account_history_api return, block, trx id, timestamp), the greeting on
+  connect says where each stream stands, and
   what came before that is fetched from the node's APIs. Nothing here
   rebuilds HAF.
 * **The writer never waits.** Matches go to a sink thread through a queue
@@ -80,9 +81,12 @@ Why it is shaped the way it is:
 Attributes compare to literals only, never to each other: `from = to` is
 not expressible, and a derived flag for such a relation is added on
 request rather than guessed. An undefined attribute fails every test on
-it, which is why a rule on `amount` or `custom_id` usually carries an
-`op_type` term as well, and why one on `impacted_accounts` alone is the
-expensive kind (every operation reaches it; keep those to a few dozen).
+it, so `custom_id` only ever matches a custom_json and `amount` only an
+operation that has one; that is still ten operation types, so a rule on
+`amount` usually names the `op_type` it means. An `op_type` term also lets
+the index hand the rule only operations of that type, which is why a rule
+on `impacted_accounts` alone is the expensive kind (every operation reaches
+it; keep those to a few dozen).
 
 ## The expression language
 
